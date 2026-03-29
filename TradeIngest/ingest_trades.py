@@ -3,10 +3,11 @@ Trade Ingest Pipeline
 =====================
 Processes raw trade CSV files + fee reports (_AR) into a SQLite database.
 
-Input:  M-D-YY.csv      (raw executions: time, symbol, side, price, qty, route, type)
+Data:   Reads from SPTD 2026 folder:
+        M-D-YY.csv      (raw executions: time, symbol, side, price, qty, route, type)
         M-D-YY_AR.csv   (account report: per-symbol fees and summary stats)
 
-Output: trades.db with tables:
+Output: trades.db (in TradeIngest/) with tables:
         - raw_executions  (every fill, append-only)
         - trades          (consolidated: first entry → position back to 0)
         - trade_executions (links each raw execution to its parent trade)
@@ -27,6 +28,7 @@ from pathlib import Path
 
 DB_NAME = "trades.db"
 SCRIPT_DIR = Path(__file__).parent
+DATA_DIR = Path(r"C:\Users\sspma\OneDrive\Desktop\Trading Statistics\Personal Stats and Expense Sheets\SPTD 2026")
 
 
 # ---------------------------------------------------------------------------
@@ -483,8 +485,8 @@ def insert_trades(conn, trades, execution_ids):
 
 def process_day(conn, date_prefix):
     """Process one trading day given its file prefix (e.g., '3-27-26')."""
-    csv_path = SCRIPT_DIR / f"{date_prefix}.csv"
-    ar_path = SCRIPT_DIR / f"{date_prefix}_AR.csv"
+    csv_path = DATA_DIR / f"{date_prefix}.csv"
+    ar_path = DATA_DIR / f"{date_prefix}_AR.csv"
 
     if not csv_path.exists():
         print(f"  ERROR: {csv_path} not found, skipping.")
@@ -557,7 +559,7 @@ def process_day(conn, date_prefix):
 def find_all_date_prefixes():
     """Find all M-D-YY.csv files (not _AR) in the script directory."""
     prefixes = []
-    for f in SCRIPT_DIR.glob("*.csv"):
+    for f in DATA_DIR.glob("*.csv"):
         name = f.stem
         if name.endswith("_AR"):
             continue
