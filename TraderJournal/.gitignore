@@ -1,0 +1,24 @@
+# Dependencies
+node_modules/
+
+# Next.js
+trader-journal/.next/
+
+# Data files (keep out of git)
+trades.xlsx
+~$*.xlsx
+backups/
+chart-cache/
+trades_db/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+
+# Environment
+.env
+.env.local
