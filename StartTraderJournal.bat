@@ -1,6 +1,6 @@
 @echo off
 title Trader Journal
-cd /d "%~dp0trader-journal"
+cd /d "%~dp0TraderJournal\trader-journal"
 
 echo Starting Trader Journal...
 echo.
