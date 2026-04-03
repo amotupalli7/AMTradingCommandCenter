@@ -12,6 +12,31 @@ import { Input } from "@/components/ui/input";
 import { cn } from "@/lib/utils";
 import { isLongSide, tagColor, parseTags } from "@/lib/tradeUtils";
 import { useChartPreload } from "@/hooks/useChartPreload";
+import { useDatasets, Datasets } from "@/hooks/useDatasets";
+
+// ─── Data filter types ──────────────────────────────────────────────────────
+// dataFilters maps dataset name → selected value ("" = all)
+type DataFilters = Record<string, string>;
+
+function applyDataFilters(
+  trades: Trade[],
+  dataFilters: DataFilters,
+  datasets: Datasets
+): Trade[] {
+  const active = Object.entries(dataFilters).filter(([, v]) => v !== "");
+  if (active.length === 0) return trades;
+
+  return trades.filter((trade) => {
+    const id = String(trade["Trade ID"]);
+    for (const [name, selected] of active) {
+      const ds = datasets[name];
+      if (!ds) continue;
+      const val = ds.values[id] ?? "";
+      if (val !== selected) return false;
+    }
+    return true;
+  });
+}
 
 interface TradeTableProps {
   trades: Trade[];
@@ -132,6 +157,8 @@ export function TradeTable({ trades, onRefresh }: TradeTableProps) {
   const [sortDir, setSortDir] = useState<SortDir>("desc");
   const selectedRowRef = useRef<HTMLTableRowElement>(null);
   const chartUrls = useChartPreload();
+  const { datasets } = useDatasets();
+  const [dataFilters, setDataFilters] = useState<DataFilters>({});
 
   // All unique tags across every trade (for autocomplete)
   const everyTag = useMemo(
@@ -148,8 +175,9 @@ export function TradeTable({ trades, onRefresh }: TradeTableProps) {
   const filteredTrades = useMemo(() => {
     const afterShared = applyTradeFilters(trades, filters);
     const afterSearch = applySearch(afterShared, search);
-    return applySorting(afterSearch, sortBy, sortDir);
-  }, [trades, filters, search, sortBy, sortDir]);
+    const afterData = applyDataFilters(afterSearch, dataFilters, datasets);
+    return applySorting(afterData, sortBy, sortDir);
+  }, [trades, filters, search, dataFilters, datasets, sortBy, sortDir]);
 
   // Cascading option lists
   const afterSideResultDate = useMemo(() => applyTradeFilters(trades, {
@@ -251,7 +279,8 @@ export function TradeTable({ trades, onRefresh }: TradeTableProps) {
     (filters.priceMin !== "" ? 1 : 0) +
     (filters.priceMax !== "" ? 1 : 0);
 
-  const hasActiveFilters = activeFilterCount > 0 || search !== "";
+  const activeDataFilterCount = Object.values(dataFilters).filter((v) => v !== "").length;
+  const hasActiveFilters = activeFilterCount > 0 || activeDataFilterCount > 0 || search !== "";
 
   return (
     <div className="space-y-3">
@@ -380,7 +409,7 @@ export function TradeTable({ trades, onRefresh }: TradeTableProps) {
         {/* Clear all */}
         {hasActiveFilters && (
           <button
-            onClick={() => { setFilters(EMPTY_TRADE_FILTERS); setSearch(""); }}
+            onClick={() => { setFilters(EMPTY_TRADE_FILTERS); setSearch(""); setDataFilters({}); }}
             className="ml-1 text-xs px-2.5 h-9 rounded-md border border-slate-700 text-slate-400 hover:text-white hover:border-slate-500 transition-colors"
           >
             Clear filters
@@ -402,6 +431,35 @@ export function TradeTable({ trades, onRefresh }: TradeTableProps) {
           </button>
         </div>
       </div>
+
+      {/* ── Data Filters Row ── */}
+      {Object.keys(datasets).length > 0 && (
+        <div className="flex flex-wrap gap-2 items-center border-t border-slate-800/50 pt-2">
+          <span className="text-[10px] text-slate-500 uppercase tracking-wider font-medium">Data</span>
+          {Object.entries(datasets).map(([name, ds]) => (
+            <select
+              key={name}
+              value={dataFilters[name] ?? ""}
+              onChange={(e) =>
+                setDataFilters((prev) => ({ ...prev, [name]: e.target.value }))
+              }
+              className={cn(
+                "border rounded-md px-3 h-9 text-sm focus:outline-none focus:ring-1 focus:ring-blue-500",
+                dataFilters[name]
+                  ? "border-violet-500/60 bg-violet-500/10 text-violet-300"
+                  : "bg-slate-900/50 border-slate-700 text-slate-200"
+              )}
+            >
+              <option value="">{name}: All</option>
+              {ds.options.map((opt) => (
+                <option key={opt} value={opt}>
+                  {name}: {opt}
+                </option>
+              ))}
+            </select>
+          ))}
+        </div>
+      )}
 
       {/* ── Active filter badges ── */}
       {hasActiveFilters && (
@@ -444,6 +502,16 @@ export function TradeTable({ trades, onRefresh }: TradeTableProps) {
           {filters.priceMax !== "" && (
             <ActiveBadge label={`Price ≤ $${filters.priceMax}`} onRemove={() => set({ priceMax: "" })} />
           )}
+          {Object.entries(dataFilters)
+            .filter(([, v]) => v !== "")
+            .map(([name, val]) => (
+              <ActiveBadge
+                key={`data-${name}`}
+                label={`${name}: ${val}`}
+                onRemove={() => setDataFilters((prev) => ({ ...prev, [name]: "" }))}
+                colorClass="border-violet-500/40 text-violet-400 bg-violet-500/10"
+              />
+            ))}
         </div>
       )}
 

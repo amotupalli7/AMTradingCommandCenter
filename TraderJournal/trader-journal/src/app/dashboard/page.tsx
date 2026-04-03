@@ -1,9 +1,11 @@
 "use client";
 
-import { useMemo } from "react";
+import { useState, useMemo } from "react";
 import { useTrades } from "@/hooks/useTrades";
 import { useFilters } from "@/context/FilterContext";
+import { useDatasets, Datasets } from "@/hooks/useDatasets";
 import { StatsCard } from "@/components/StatsCard";
+import { cn } from "@/lib/utils";
 
 import { CumulativePnLChart } from "@/components/charts/CumulativePnL";
 import { DrawdownChart } from "@/components/charts/DrawdownChart";
@@ -14,6 +16,7 @@ import { RDistributionChart } from "@/components/charts/RDistribution";
 import { RCalendar } from "@/components/charts/RCalendar";
 import { Skeleton } from "@/components/ui/skeleton";
 import { FilterBar, applyTradeFilters } from "@/components/FilterBar";
+import { Trade } from "@/lib/types";
 import {
   calculateStats,
   getCumulativePnL,
@@ -25,20 +28,42 @@ import {
   getDailyR,
 } from "@/lib/dashboard";
 
+type DataFilters = Record<string, string>;
+
+function applyDataFilters(
+  trades: Trade[],
+  dataFilters: DataFilters,
+  datasets: Datasets
+): Trade[] {
+  const active = Object.entries(dataFilters).filter(([, v]) => v !== "");
+  if (active.length === 0) return trades;
+  return trades.filter((trade) => {
+    const id = String(trade["Trade ID"]);
+    for (const [name, selected] of active) {
+      const ds = datasets[name];
+      if (!ds) continue;
+      if ((ds.values[id] ?? "") !== selected) return false;
+    }
+    return true;
+  });
+}
+
 export default function DashboardPage() {
   const { trades, isLoading, error } = useTrades();
   const { filters, setFilters } = useFilters();
+  const { datasets } = useDatasets();
+  const [dataFilters, setDataFilters] = useState<DataFilters>({});
 
-  const filteredTrades = useMemo(
-    () => applyTradeFilters(trades, filters),
-    [trades, filters]
-  );
+  const filteredTrades = useMemo(() => {
+    const afterTrade = applyTradeFilters(trades, filters);
+    return applyDataFilters(afterTrade, dataFilters, datasets);
+  }, [trades, filters, dataFilters, datasets]);
 
   // Calendar uses non-date filters so all days remain visible for navigation
-  const calendarTrades = useMemo(
-    () => applyTradeFilters(trades, { ...filters, dateFrom: "", dateTo: "" }),
-    [trades, filters]
-  );
+  const calendarTrades = useMemo(() => {
+    const afterTrade = applyTradeFilters(trades, { ...filters, dateFrom: "", dateTo: "" });
+    return applyDataFilters(afterTrade, dataFilters, datasets);
+  }, [trades, filters, dataFilters, datasets]);
   const dailyR = useMemo(() => getDailyR(calendarTrades), [calendarTrades]);
 
   // Compute all stats/charts from filtered trades (client-side, no executions needed)
@@ -98,6 +123,35 @@ export default function DashboardPage() {
         totalCount={trades.length}
         filteredCount={filteredTrades.length}
       />
+
+      {/* Data Filters */}
+      {Object.keys(datasets).length > 0 && (
+        <div className="flex flex-wrap gap-2 items-center">
+          <span className="text-[10px] text-slate-500 uppercase tracking-wider font-medium">Data</span>
+          {Object.entries(datasets).map(([name, ds]) => (
+            <select
+              key={name}
+              value={dataFilters[name] ?? ""}
+              onChange={(e) =>
+                setDataFilters((prev) => ({ ...prev, [name]: e.target.value }))
+              }
+              className={cn(
+                "border rounded-md px-3 h-9 text-sm focus:outline-none focus:ring-1 focus:ring-blue-500",
+                dataFilters[name]
+                  ? "border-violet-500/60 bg-violet-500/10 text-violet-300"
+                  : "bg-slate-900/50 border-slate-700 text-slate-200"
+              )}
+            >
+              <option value="">{name}: All</option>
+              {ds.options.map((opt) => (
+                <option key={opt} value={opt}>
+                  {name}: {opt}
+                </option>
+              ))}
+            </select>
+          ))}
+        </div>
+      )}
 
       {filteredTrades.length === 0 ? (
         <div className="flex items-center justify-center h-48 text-slate-500 text-sm">
