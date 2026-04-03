@@ -11,6 +11,7 @@ import { Badge } from "@/components/ui/badge";
 import { Input } from "@/components/ui/input";
 import { cn } from "@/lib/utils";
 import { isLongSide, tagColor, parseTags } from "@/lib/tradeUtils";
+import { useChartPreload } from "@/hooks/useChartPreload";
 
 interface TradeTableProps {
   trades: Trade[];
@@ -130,10 +131,17 @@ export function TradeTable({ trades, onRefresh }: TradeTableProps) {
   const [sortBy, setSortBy] = useState<SortKey>("default");
   const [sortDir, setSortDir] = useState<SortDir>("desc");
   const selectedRowRef = useRef<HTMLTableRowElement>(null);
+  const chartUrls = useChartPreload();
 
   // All unique tags across every trade (for autocomplete)
   const everyTag = useMemo(
     () => unique(trades.flatMap((t) => parseTags(t.Tags))),
+    [trades]
+  );
+
+  // All unique triggers across every trade (for autocomplete)
+  const everyTrigger = useMemo(
+    () => unique(trades.map((t) => t.Trigger).filter(Boolean)),
     [trades]
   );
 
@@ -170,9 +178,20 @@ export function TradeTable({ trades, onRefresh }: TradeTableProps) {
     setups: filters.setups, subSetups: filters.subSetups,
   }), [trades, filters.side, filters.result, filters.dateFrom, filters.dateTo, filters.setups, filters.subSetups]);
 
-  const allTags = useMemo(
-    () => unique(afterSubSetups.flatMap((t) => parseTags(t.Tags))),
+  const allTriggers = useMemo(
+    () => unique(afterSubSetups.map((t) => t.Trigger).filter(Boolean)),
     [afterSubSetups]
+  );
+
+  const afterTriggers = useMemo(() => applyTradeFilters(trades, {
+    ...EMPTY_TRADE_FILTERS, side: filters.side, result: filters.result,
+    dateFrom: filters.dateFrom, dateTo: filters.dateTo,
+    setups: filters.setups, subSetups: filters.subSetups, triggers: filters.triggers,
+  }), [trades, filters.side, filters.result, filters.dateFrom, filters.dateTo, filters.setups, filters.subSetups, filters.triggers]);
+
+  const allTags = useMemo(
+    () => unique(afterTriggers.flatMap((t) => parseTags(t.Tags))),
+    [afterTriggers]
   );
 
   // Clicking a sortable column: if already active, flip direction; else switch to it (desc first)
@@ -211,6 +230,8 @@ export function TradeTable({ trades, onRefresh }: TradeTableProps) {
     set({ setups: filters.setups.includes(v) ? filters.setups.filter((x) => x !== v) : [...filters.setups, v] });
   const toggleSubSetup = (v: string) =>
     set({ subSetups: filters.subSetups.includes(v) ? filters.subSetups.filter((x) => x !== v) : [...filters.subSetups, v] });
+  const toggleTrigger = (v: string) =>
+    set({ triggers: filters.triggers.includes(v) ? filters.triggers.filter((x) => x !== v) : [...filters.triggers, v] });
   const toggleTag = (v: string) =>
     set({ tags: filters.tags.includes(v) ? filters.tags.filter((x) => x !== v) : [...filters.tags, v] });
   const toggleExcludeTag = (v: string) =>
@@ -222,6 +243,7 @@ export function TradeTable({ trades, onRefresh }: TradeTableProps) {
     (filters.result ? 1 : 0) +
     filters.setups.length +
     filters.subSetups.length +
+    filters.triggers.length +
     filters.tags.length +
     filters.excludeTags.length +
     (filters.dateFrom ? 1 : 0) +
@@ -282,6 +304,15 @@ export function TradeTable({ trades, onRefresh }: TradeTableProps) {
           selected={filters.subSetups}
           onToggle={toggleSubSetup}
           onSelectAll={(all) => set({ subSetups: all })}
+        />
+
+        {/* Trigger dropdown */}
+        <MultiSelectDropdown
+          label="Trigger"
+          options={allTriggers}
+          selected={filters.triggers}
+          onToggle={toggleTrigger}
+          onSelectAll={(all) => set({ triggers: all })}
         />
 
         {/* Tags dropdown */}
@@ -391,6 +422,9 @@ export function TradeTable({ trades, onRefresh }: TradeTableProps) {
           ))}
           {filters.subSetups.map((s) => (
             <ActiveBadge key={s} label={`Sub: ${s}`} onRemove={() => toggleSubSetup(s)} />
+          ))}
+          {filters.triggers.map((t) => (
+            <ActiveBadge key={t} label={`Trigger: ${t}`} onRemove={() => toggleTrigger(t)} />
           ))}
           {filters.tags.map((t) => (
             <ActiveBadge key={t} label={t} onRemove={() => toggleTag(t)} colorClass={tagColor(t)} />
@@ -507,7 +541,7 @@ export function TradeTable({ trades, onRefresh }: TradeTableProps) {
 
           {/* Scrollable Content */}
           <div className="flex-1 overflow-y-auto">
-            <TradeDetail key={selectedTrade["Trade ID"]} trade={selectedTrade} allTags={everyTag} onSaved={onRefresh} />
+            <TradeDetail key={selectedTrade["Trade ID"]} trade={selectedTrade} allTags={everyTag} allTriggers={everyTrigger} chartUrl={chartUrls[selectedTrade["Trade ID"]]} onSaved={onRefresh} />
           </div>
         </div>
       )}

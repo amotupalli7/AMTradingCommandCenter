@@ -12,13 +12,17 @@ import { isLongSide, tagColor, parseTags } from "@/lib/tradeUtils";
 interface TradeDetailProps {
   trade: Trade;
   allTags?: string[];
+  allTriggers?: string[];
+  chartUrl?: string;
   onSaved?: () => void;
 }
 
-export function TradeDetail({ trade, allTags = [], onSaved }: TradeDetailProps) {
+export function TradeDetail({ trade, allTags = [], allTriggers = [], chartUrl, onSaved }: TradeDetailProps) {
   const [imageLoaded, setImageLoaded] = useState(false);
   const [imageError, setImageError] = useState(false);
   const [lightboxOpen, setLightboxOpen] = useState(false);
+
+  const imageSrc = chartUrl || `/api/trade/${trade["Trade ID"]}/image`;
 
   const pnlColor =
     trade["Net P&L"] >= 0 ? "text-emerald-400" : "text-red-400";
@@ -83,7 +87,7 @@ export function TradeDetail({ trade, allTags = [], onSaved }: TradeDetailProps) 
                 </div>
               )}
               <img
-                src={`/api/trade/${trade["Trade ID"]}/image`}
+                src={imageSrc}
                 alt={`${trade.Ticker} chart`}
                 className={cn(
                   "w-full object-contain cursor-zoom-in",
@@ -104,7 +108,7 @@ export function TradeDetail({ trade, allTags = [], onSaved }: TradeDetailProps) 
         {/* Chart Lightbox */}
         {lightboxOpen && imageLoaded && (
           <ChartLightbox
-            src={`/api/trade/${trade["Trade ID"]}/image`}
+            src={imageSrc}
             alt={`${trade.Ticker} chart`}
             onClose={() => setLightboxOpen(false)}
           />
@@ -138,6 +142,14 @@ export function TradeDetail({ trade, allTags = [], onSaved }: TradeDetailProps) 
             className="text-slate-200"
           />
         </div>
+
+        {/* Trigger */}
+        <TriggerEditor
+          trigger={trade.Trigger}
+          tradeId={trade["Trade ID"]}
+          allTriggers={allTriggers}
+          onSaved={onSaved}
+        />
 
         {/* Tags as badges */}
         <TagsEditor
@@ -362,6 +374,151 @@ function ChartLightbox({
           if (!didDrag.current && !isZoomed) onClose();
         }}
       />
+    </div>
+  );
+}
+
+function TriggerEditor({
+  trigger: initialTrigger,
+  tradeId,
+  allTriggers = [],
+  onSaved,
+}: {
+  trigger: string;
+  tradeId: number;
+  allTriggers?: string[];
+  onSaved?: () => void;
+}) {
+  const [value, setValue] = useState(initialTrigger || "");
+  const [status, setStatus] = useState<"idle" | "saving" | "saved" | "error">("idle");
+  const [showSuggestions, setShowSuggestions] = useState(false);
+  const [highlightIndex, setHighlightIndex] = useState(-1);
+  const timeoutRef = useRef<NodeJS.Timeout | null>(null);
+  const wrapperRef = useRef<HTMLDivElement>(null);
+
+  const suggestions = value.trim()
+    ? allTriggers.filter(
+        (t) => t.toLowerCase().includes(value.trim().toLowerCase()) && t !== value
+      )
+    : allTriggers.filter((t) => t !== value);
+
+  const save = useCallback(
+    async (newValue: string) => {
+      setStatus("saving");
+      try {
+        const resp = await fetch(`/api/trade/${tradeId}`, {
+          method: "PATCH",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ field: "Trigger", value: newValue }),
+        });
+        if (!resp.ok) throw new Error("Save failed");
+        setStatus("saved");
+        onSaved?.();
+        if (timeoutRef.current) clearTimeout(timeoutRef.current);
+        timeoutRef.current = setTimeout(() => setStatus("idle"), 2000);
+      } catch {
+        setStatus("error");
+        if (timeoutRef.current) clearTimeout(timeoutRef.current);
+        timeoutRef.current = setTimeout(() => setStatus("idle"), 3000);
+      }
+    },
+    [tradeId, onSaved]
+  );
+
+  const selectSuggestion = useCallback(
+    (val: string) => {
+      setValue(val);
+      setShowSuggestions(false);
+      setHighlightIndex(-1);
+      save(val);
+    },
+    [save]
+  );
+
+  const handleKeyDown = (e: React.KeyboardEvent) => {
+    e.stopPropagation();
+    if (e.key === "ArrowDown") {
+      e.preventDefault();
+      setHighlightIndex((i) => Math.min(i + 1, suggestions.length - 1));
+    } else if (e.key === "ArrowUp") {
+      e.preventDefault();
+      setHighlightIndex((i) => Math.max(i - 1, 0));
+    } else if (e.key === "Enter") {
+      e.preventDefault();
+      if (highlightIndex >= 0 && highlightIndex < suggestions.length) {
+        selectSuggestion(suggestions[highlightIndex]);
+      } else {
+        setShowSuggestions(false);
+        save(value.trim());
+      }
+    } else if (e.key === "Escape") {
+      setShowSuggestions(false);
+      setHighlightIndex(-1);
+    }
+  };
+
+  // Close dropdown on outside click
+  useEffect(() => {
+    const handleClick = (e: MouseEvent) => {
+      if (wrapperRef.current && !wrapperRef.current.contains(e.target as Node)) {
+        setShowSuggestions(false);
+      }
+    };
+    document.addEventListener("mousedown", handleClick);
+    return () => document.removeEventListener("mousedown", handleClick);
+  }, []);
+
+  return (
+    <div className="space-y-1.5">
+      <div className="flex items-center gap-2">
+        <span className="text-xs font-medium text-muted-foreground uppercase tracking-wider">
+          Trigger
+        </span>
+        {status === "saved" && <span className="text-xs text-emerald-400">Saved</span>}
+        {status === "error" && <span className="text-xs text-red-400">Error</span>}
+        {status === "saving" && <span className="text-xs text-blue-400">Saving...</span>}
+      </div>
+      <div ref={wrapperRef} className="relative w-56">
+        <Input
+          type="text"
+          value={value}
+          onChange={(e) => {
+            setValue(e.target.value);
+            setShowSuggestions(true);
+            setHighlightIndex(-1);
+          }}
+          onFocus={() => setShowSuggestions(true)}
+          onKeyDown={handleKeyDown}
+          onBlur={() => {
+            setTimeout(() => {
+              setShowSuggestions(false);
+              if (value.trim() !== initialTrigger) save(value.trim());
+            }, 150);
+          }}
+          placeholder="Set trigger..."
+          className="h-8 bg-transparent border-slate-700 text-sm px-2 focus-visible:ring-1 focus-visible:ring-blue-500"
+        />
+        {showSuggestions && suggestions.length > 0 && (
+          <div className="absolute top-full left-0 mt-1 w-full max-h-40 overflow-y-auto rounded-md border border-slate-700 bg-slate-800 shadow-lg z-50">
+            {suggestions.map((s, i) => (
+              <button
+                key={s}
+                type="button"
+                className={cn(
+                  "w-full text-left px-3 py-1.5 text-xs text-slate-300 hover:bg-slate-700 hover:text-white transition-colors",
+                  i === highlightIndex && "bg-slate-700 text-white"
+                )}
+                onMouseDown={(e) => {
+                  e.preventDefault();
+                  selectSuggestion(s);
+                }}
+              >
+                {s}
+              </button>
+            ))}
+          </div>
+        )}
+      </div>
     </div>
   );
 }

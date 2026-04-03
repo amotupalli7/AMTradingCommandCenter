@@ -11,6 +11,7 @@ export interface Trade {
   "X Score": number;
   Setup: string;
   "Sub-Setup": string;
+  Trigger: string;
   Tags: string;
   "Entry Notes": string;
   "Exit Notes": string;
@@ -97,6 +98,7 @@ export interface RBin {
 }
 
 export const EDITABLE_FIELDS = [
+  "Trigger",
   "Tags",
   "Entry Notes",
   "Exit Notes",

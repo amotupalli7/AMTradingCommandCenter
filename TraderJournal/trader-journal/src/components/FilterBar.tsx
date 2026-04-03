@@ -11,6 +11,7 @@ export interface TradeFilters {
   result: string;
   setups: string[];
   subSetups: string[];
+  triggers: string[];
   tags: string[];
   excludeTags: string[];
   dateFrom: string;
@@ -24,6 +25,7 @@ export const EMPTY_TRADE_FILTERS: TradeFilters = {
   result: "",
   setups: [],
   subSetups: [],
+  triggers: [],
   tags: [],
   excludeTags: [],
   dateFrom: "",
@@ -38,6 +40,7 @@ import { isLongSide } from "@/lib/tradeUtils";
 export function applyTradeFilters(trades: Trade[], f: TradeFilters): Trade[] {
   const filterSetups = f.setups.map((s) => s.toLowerCase());
   const filterSubSetups = f.subSetups.map((s) => s.toLowerCase());
+  const filterTriggers = f.triggers.map((t) => t.toLowerCase());
   const filterTags = f.tags.map((t) => t.toLowerCase());
   const excludeTags = f.excludeTags.map((t) => t.toLowerCase());
 
@@ -51,6 +54,7 @@ export function applyTradeFilters(trades: Trade[], f: TradeFilters): Trade[] {
     if (f.result === "loss" && trade.Win !== 0) return false;
     if (filterSetups.length > 0 && !filterSetups.includes(trade.Setup.toLowerCase())) return false;
     if (filterSubSetups.length > 0 && !filterSubSetups.includes(trade["Sub-Setup"].toLowerCase())) return false;
+    if (filterTriggers.length > 0 && !filterTriggers.includes((trade.Trigger || "").toLowerCase())) return false;
     if (filterTags.length > 0 || excludeTags.length > 0) {
       const tradeTags = parseTags(trade.Tags).map((t) => t.toLowerCase());
       if (filterTags.length > 0 && !filterTags.some((t) => tradeTags.includes(t))) return false;
@@ -115,34 +119,50 @@ export function FilterBar({ trades, filters, onChange, totalCount, filteredCount
     setups: filters.setups, subSetups: filters.subSetups,
   }), [trades, filters.side, filters.result, filters.dateFrom, filters.dateTo, filters.setups, filters.subSetups]);
 
-  const allTags = useMemo(
-    () => unique(afterSubSetups.flatMap((t) => parseTags(t.Tags))),
+  const allTriggers = useMemo(
+    () => unique(afterSubSetups.map((t) => t.Trigger).filter(Boolean)),
     [afterSubSetups]
+  );
+
+  const afterTriggers = useMemo(() => applyTradeFilters(trades, {
+    ...EMPTY_TRADE_FILTERS, side: filters.side, result: filters.result,
+    dateFrom: filters.dateFrom, dateTo: filters.dateTo,
+    setups: filters.setups, subSetups: filters.subSetups, triggers: filters.triggers,
+  }), [trades, filters.side, filters.result, filters.dateFrom, filters.dateTo, filters.setups, filters.subSetups, filters.triggers]);
+
+  const allTags = useMemo(
+    () => unique(afterTriggers.flatMap((t) => parseTags(t.Tags))),
+    [afterTriggers]
   );
 
   // Drop selected values that are no longer valid after upstream changes
   useEffect(() => {
     const validSetups = new Set(allSetups);
     const validSubSetups = new Set(allSubSetups);
+    const validTriggers = new Set(allTriggers);
     const validTags = new Set(allTags);
     const nextSetups = filters.setups.filter((s) => validSetups.has(s));
     const nextSubSetups = filters.subSetups.filter((s) => validSubSetups.has(s));
+    const nextTriggers = filters.triggers.filter((t) => validTriggers.has(t));
     const nextTags = filters.tags.filter((t) => validTags.has(t));
     const nextExcludeTags = filters.excludeTags.filter((t) => validTags.has(t));
     if (
       nextSetups.length !== filters.setups.length ||
       nextSubSetups.length !== filters.subSetups.length ||
+      nextTriggers.length !== filters.triggers.length ||
       nextTags.length !== filters.tags.length ||
       nextExcludeTags.length !== filters.excludeTags.length
     ) {
-      onChange({ ...filters, setups: nextSetups, subSetups: nextSubSetups, tags: nextTags, excludeTags: nextExcludeTags });
+      onChange({ ...filters, setups: nextSetups, subSetups: nextSubSetups, triggers: nextTriggers, tags: nextTags, excludeTags: nextExcludeTags });
     }
-  }, [allSetups, allSubSetups, allTags]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [allSetups, allSubSetups, allTriggers, allTags]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const toggleSetup = (v: string) =>
     set({ setups: filters.setups.includes(v) ? filters.setups.filter((x) => x !== v) : [...filters.setups, v] });
   const toggleSubSetup = (v: string) =>
     set({ subSetups: filters.subSetups.includes(v) ? filters.subSetups.filter((x) => x !== v) : [...filters.subSetups, v] });
+  const toggleTrigger = (v: string) =>
+    set({ triggers: filters.triggers.includes(v) ? filters.triggers.filter((x) => x !== v) : [...filters.triggers, v] });
   const toggleTag = (v: string) =>
     set({ tags: filters.tags.includes(v) ? filters.tags.filter((x) => x !== v) : [...filters.tags, v] });
   const toggleExcludeTag = (v: string) =>
@@ -153,6 +173,7 @@ export function FilterBar({ trades, filters, onChange, totalCount, filteredCount
     (filters.result ? 1 : 0) +
     filters.setups.length +
     filters.subSetups.length +
+    filters.triggers.length +
     filters.tags.length +
     filters.excludeTags.length +
     (filters.dateFrom ? 1 : 0) +
@@ -200,6 +221,13 @@ export function FilterBar({ trades, filters, onChange, totalCount, filteredCount
           selected={filters.subSetups}
           onToggle={toggleSubSetup}
           onSelectAll={(all) => set({ subSetups: all })}
+        />
+        <MultiSelectDropdown
+          label="Trigger"
+          options={allTriggers}
+          selected={filters.triggers}
+          onToggle={toggleTrigger}
+          onSelectAll={(all) => set({ triggers: all })}
         />
         <MultiSelectDropdown
           label="Tags"
@@ -291,6 +319,9 @@ export function FilterBar({ trades, filters, onChange, totalCount, filteredCount
           ))}
           {filters.subSetups.map((s) => (
             <ActiveBadge key={s} label={`Sub: ${s}`} onRemove={() => toggleSubSetup(s)} />
+          ))}
+          {filters.triggers.map((t) => (
+            <ActiveBadge key={t} label={`Trigger: ${t}`} onRemove={() => toggleTrigger(t)} />
           ))}
           {filters.tags.map((t) => (
             <ActiveBadge key={t} label={t} onRemove={() => toggleTag(t)} colorClass={tagColor(t)} />

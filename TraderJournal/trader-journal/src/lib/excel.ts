@@ -91,6 +91,7 @@ export function readTrades(): Trade[] {
       "X Score": Number(g("Xscore") || g("X Score")) || 0,
       Setup: String(g("Setup") || ""),
       "Sub-Setup": String(g("Sub-Setup") || ""),
+      Trigger: String(g("Trigger") || ""),
       Tags: String(g("Tags") || ""),
       "Entry Notes": String(g("Entry Notes") || ""),
       "Exit Notes": String(g("Exit Notes") || ""),
