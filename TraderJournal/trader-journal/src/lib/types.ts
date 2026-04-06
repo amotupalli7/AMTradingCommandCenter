@@ -97,6 +97,14 @@ export interface RBin {
   count: number;
 }
 
+export interface TimeBucket {
+  time: string;
+  pnl: number;
+  r: number;
+  count: number;
+  winRate: number;
+}
+
 export const EDITABLE_FIELDS = [
   "Trigger",
   "Tags",

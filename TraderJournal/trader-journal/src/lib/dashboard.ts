@@ -1,4 +1,4 @@
-import { Trade, Execution, DashboardStats, ChartDataPoint, SetupPnL, RBin } from "./types";
+import { Trade, Execution, DashboardStats, ChartDataPoint, SetupPnL, RBin, TimeBucket } from "./types";
 
 export function calculateStats(executions: Execution[], trades: Trade[]): DashboardStats {
   // Use unique trades (filter by New Trade = 1 or deduplicate by Trade ID)
@@ -195,6 +195,44 @@ export function getRDistribution(trades: Trade[]): RBin[] {
   }
 
   return bins;
+}
+
+/**
+ * Bucket trades by enter time into 30-minute intervals.
+ * Returns P&L, R, count, and win rate per bucket.
+ */
+export function getPnLByTime(trades: Trade[]): TimeBucket[] {
+  const buckets: Record<string, { pnl: number; r: number; count: number; wins: number }> = {};
+
+  for (const t of trades) {
+    const time = t["Enter Time"];
+    if (!time) continue;
+
+    // Parse HH:MM from "HH:MM:SS" or "HH:MM" and round down to 30-min
+    const parts = time.split(":");
+    const h = parseInt(parts[0], 10);
+    const m = parseInt(parts[1], 10);
+    if (isNaN(h) || isNaN(m)) continue;
+
+    const bucket30 = m < 30 ? "00" : "30";
+    const key = `${String(h).padStart(2, "0")}:${bucket30}`;
+
+    if (!buckets[key]) buckets[key] = { pnl: 0, r: 0, count: 0, wins: 0 };
+    buckets[key].pnl += t["Net P&L"];
+    buckets[key].r += t["Net R"];
+    buckets[key].count += 1;
+    if (t.Win === 1) buckets[key].wins += 1;
+  }
+
+  return Object.entries(buckets)
+    .sort(([a], [b]) => a.localeCompare(b))
+    .map(([time, d]) => ({
+      time,
+      pnl: parseFloat(d.pnl.toFixed(2)),
+      r: parseFloat(d.r.toFixed(2)),
+      count: d.count,
+      winRate: d.count > 0 ? parseFloat(((d.wins / d.count) * 100).toFixed(1)) : 0,
+    }));
 }
 
 export function getDailyR(trades: Trade[]): Record<string, number> {

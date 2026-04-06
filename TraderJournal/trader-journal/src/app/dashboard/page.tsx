@@ -13,6 +13,7 @@ import { CumulativeRChart } from "@/components/charts/CumulativeR";
 import { RDrawdownChart } from "@/components/charts/RDrawdown";
 import { PnLBySetupChart } from "@/components/charts/PnLBySetup";
 import { RDistributionChart } from "@/components/charts/RDistribution";
+import { PnLByTimeChart } from "@/components/charts/PnLByTime";
 import { RCalendar } from "@/components/charts/RCalendar";
 import { Skeleton } from "@/components/ui/skeleton";
 import { FilterBar, applyTradeFilters } from "@/components/FilterBar";
@@ -25,6 +26,7 @@ import {
   getRDrawdownSeries,
   getPnLBySetup,
   getRDistribution,
+  getPnLByTime,
   getDailyR,
 } from "@/lib/dashboard";
 
@@ -79,6 +81,7 @@ export default function DashboardPage() {
       cumulativeR: getCumulativeR(filteredTrades),
       rDrawdown: getRDrawdownSeries(filteredTrades),
       pnlBySetup: getPnLBySetup(filteredTrades),
+      pnlByTime: getPnLByTime(filteredTrades),
       rDistribution: getRDistribution(filteredTrades),
     };
   }, [filteredTrades]);
@@ -251,6 +254,9 @@ export default function DashboardPage() {
             </ChartPanel>
             <ChartPanel title="P&L by Setup">
               <PnLBySetupChart data={charts?.pnlBySetup || []} />
+            </ChartPanel>
+            <ChartPanel title="P&L by Entry Time">
+              <PnLByTimeChart data={charts?.pnlByTime || []} />
             </ChartPanel>
             <ChartPanel title="R Distribution">
               <RDistributionChart data={charts?.rDistribution || []} />
