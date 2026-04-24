@@ -234,18 +234,59 @@ def load_fees(ar_path, trade_date):
 # Trade grouping algorithm
 # ---------------------------------------------------------------------------
 
-def group_into_trades(executions, trade_date):
+def find_open_carry(conn, symbol, trade_date):
+    """
+    Look up the most recent trade for `symbol` strictly before `trade_date`.
+    If it's unclosed (entry_shares != exit_shares), return its raw executions
+    plus the trade row, so today's executions can be stitched onto it.
+    """
+    row = conn.execute("""
+        SELECT id, date, entry_time, total_entry_shares, total_exit_shares
+        FROM trades
+        WHERE symbol = ? AND date < ?
+        ORDER BY date DESC, entry_time DESC
+        LIMIT 1
+    """, (symbol, trade_date)).fetchone()
+    if not row:
+        return None
+    trade_id, prior_date, prior_entry, in_sh, out_sh = row
+    if in_sh == out_sh:
+        return None  # already flat
+
+    execs = conn.execute("""
+        SELECT re.id, re.date, re.time, re.symbol, re.side, re.price, re.qty, re.route, re.type
+        FROM raw_executions re
+        JOIN trade_executions te ON te.execution_id = re.id
+        WHERE te.trade_id = ?
+        ORDER BY re.date, re.time
+    """, (trade_id,)).fetchall()
+
+    prior_execs = [{
+        "_db_id": e[0], "date": e[1], "time": e[2], "symbol": e[3],
+        "side": e[4], "price": e[5], "qty": e[6], "route": e[7], "type": e[8],
+    } for e in execs]
+
+    return {"trade_id": trade_id, "prior_date": prior_date,
+            "prior_entry_time": prior_entry, "prior_execs": prior_execs}
+
+
+def group_into_trades(executions, trade_date, conn=None):
     """
     Group raw executions into trades.
 
     A "trade" is all executions on a symbol from first entry until position
     returns to zero. Partial covers, adds, scales — all part of the same trade.
+    Trades can span multiple days: if a prior day left an open position on a
+    symbol, today's executions are stitched onto that prior trade and the
+    trade is anchored to its original entry date.
 
-    Returns list of trade dicts, each containing:
+    Returns list of trade dicts. Each trade has:
       - metadata (symbol, direction, times, prices, pnl)
-      - execution_indices (indices into the executions list)
+      - execution_indices: indices into today's `executions` list
+      - carry: optional dict with prior trade_id and prior raw-exec ids when
+        this trade absorbed a carry-forward position
     """
-    # Group by symbol
+    # Group today's executions by symbol
     by_symbol = {}
     for i, ex in enumerate(executions):
         by_symbol.setdefault(ex["symbol"], []).append((i, ex))
@@ -253,35 +294,73 @@ def group_into_trades(executions, trade_date):
     trades = []
 
     for symbol, symbol_execs in sorted(by_symbol.items()):
-        position = 0
-        current_trade_execs = []
-        trade_index = 0
+        # Check for carry-forward open position from a prior day
+        carry = find_open_carry(conn, symbol, trade_date) if conn is not None else None
+
+        # Working list: (today_idx_or_None, execution_dict, signed_qty)
+        # For prior-day execs, today_idx is None and we stash the db id separately.
+        working = []
+
+        if carry:
+            for pex in carry["prior_execs"]:
+                signed = -pex["qty"] if pex["side"] in ("SS", "S") else pex["qty"]
+                working.append((None, pex, signed))
 
         for idx, ex in symbol_execs:
-            # Determine signed quantity: short/sell = negative, buy = positive
-            if ex["side"] in ("SS", "S"):
-                signed_qty = -ex["qty"]
-            else:  # B
-                signed_qty = ex["qty"]
+            signed = -ex["qty"] if ex["side"] in ("SS", "S") else ex["qty"]
+            working.append((idx, ex, signed))
 
-            current_trade_execs.append((idx, ex, signed_qty))
-            position += signed_qty
+        # Walk and split into trades on each return-to-zero.
+        # trade_index is per (date, symbol). Carry trades keep their original
+        # index (set by the prior-day insert); today-only trades on this
+        # symbol number from 1.
+        position = 0
+        current = []
+        today_trade_index = 0
+        first_carry_used = False
 
-            # Trade closes when position returns to zero
-            if position == 0 and current_trade_execs:
-                trade_index += 1
-                trade = build_trade(symbol, trade_date, trade_index, current_trade_execs)
+        for entry in working:
+            current.append(entry)
+            position += entry[2]
+
+            if position == 0 and current:
+                is_carry = (carry and not first_carry_used
+                            and any(e[0] is None for e in current))
+                if is_carry:
+                    trade = build_trade(symbol, trade_date, 0, current)  # index overwritten below
+                    trade["date"] = carry["prior_date"]
+                    trade["entry_time"] = carry["prior_entry_time"]
+                    trade["carry"] = {
+                        "trade_id": carry["trade_id"],
+                        "prior_exec_ids": [e[1]["_db_id"] for e in current if e[0] is None],
+                    }
+                    first_carry_used = True
+                else:
+                    today_trade_index += 1
+                    trade = build_trade(symbol, trade_date, today_trade_index, current)
+
                 trades.append(trade)
-                current_trade_execs = []
+                current = []
 
-        # Handle unclosed positions (position != 0 at end of data)
-        if current_trade_execs:
-            trade_index += 1
-            trade = build_trade(symbol, trade_date, trade_index, current_trade_execs)
+        # Handle unclosed leftover
+        if current:
+            is_carry = (carry and not first_carry_used
+                        and any(e[0] is None for e in current))
+            if is_carry:
+                trade = build_trade(symbol, trade_date, 0, current)
+                trade["date"] = carry["prior_date"]
+                trade["entry_time"] = carry["prior_entry_time"]
+                trade["carry"] = {
+                    "trade_id": carry["trade_id"],
+                    "prior_exec_ids": [e[1]["_db_id"] for e in current if e[0] is None],
+                }
+                first_carry_used = True
+            else:
+                today_trade_index += 1
+                trade = build_trade(symbol, trade_date, today_trade_index, current)
             trade["unclosed"] = True
             trades.append(trade)
 
-    # Sort by entry time
     trades.sort(key=lambda t: t["entry_time"])
     return trades
 
@@ -318,15 +397,16 @@ def build_trade(symbol, trade_date, trade_index, trade_execs):
         # Bought at entry_vwap, sold at exit_vwap
         gross_pnl = (exit_vwap - entry_vwap) * exit_total_shares
 
-    # Times
-    all_times = [ex["time"] for _, ex, _ in trade_execs]
-    entry_time = min(all_times)
-    exit_time = max(all_times)
+    # Times — use (date, time) so cross-day trades pick the earliest/latest
+    # execution chronologically rather than just by clock.
+    keyed_times = sorted([(ex["date"], ex["time"]) for _, ex, _ in trade_execs])
+    entry_date, entry_time = keyed_times[0]
+    exit_date, exit_time = keyed_times[-1]
 
-    # Hold time
+    # Hold time across days
     try:
-        t1 = datetime.strptime(entry_time, "%H:%M:%S")
-        t2 = datetime.strptime(exit_time, "%H:%M:%S")
+        t1 = datetime.strptime(f"{entry_date} {entry_time}", "%Y-%m-%d %H:%M:%S")
+        t2 = datetime.strptime(f"{exit_date} {exit_time}", "%Y-%m-%d %H:%M:%S")
         hold_seconds = int((t2 - t1).total_seconds())
     except Exception:
         hold_seconds = 0
@@ -337,6 +417,10 @@ def build_trade(symbol, trade_date, trade_index, trade_execs):
     for _, ex, sq in trade_execs:
         running += sq
         max_pos = max(max_pos, abs(running))
+
+    # Shares traded *today* (excludes carry-forward executions from prior days).
+    # Carry execs have idx=None; today's execs have an integer idx.
+    today_shares_traded = sum(ex["qty"] for idx, ex, _ in trade_execs if idx is not None)
 
     return {
         "date": trade_date,
@@ -353,7 +437,8 @@ def build_trade(symbol, trade_date, trade_index, trade_execs):
         "gross_pnl": round(gross_pnl, 2),
         "hold_time_seconds": hold_seconds,
         "trade_index": trade_index,
-        "execution_indices": [idx for idx, _, _ in trade_execs],
+        "execution_indices": [idx for idx, _, _ in trade_execs if idx is not None],
+        "today_shares_traded": today_shares_traded,
         "unclosed": False,
     }
 
@@ -362,44 +447,57 @@ def build_trade(symbol, trade_date, trade_index, trade_execs):
 # Fee allocation
 # ---------------------------------------------------------------------------
 
-def allocate_fees(trades, fee_rows):
+def allocate_fees(trades, fee_rows, prior_fees_by_trade=None):
     """
     Allocate daily per-symbol fees proportionally across trades on that symbol.
-    Proportion is based on each trade's share of total entry shares for the symbol.
-    """
-    # Build fee lookup: symbol -> fee dict
-    fee_by_symbol = {}
-    for fr in fee_rows:
-        fee_by_symbol[fr["symbol"]] = fr
 
-    # Get total entry shares per symbol across all trades
-    symbol_total_shares = {}
+    Today's fees (from `fee_rows`) are split in proportion to each trade's
+    today-traded shares (entry + exit done on this trading day). For trades
+    that absorbed a carry-forward position, `prior_fees_by_trade` supplies
+    the fees already booked on the prior day's trade row, which are added
+    on top of today's allocation.
+
+    Commission is $0.0025 per share traded across all days of the trade.
+    """
+    fee_by_symbol = {fr["symbol"]: fr for fr in fee_rows}
+    prior_fees_by_trade = prior_fees_by_trade or {}
+
+    # How many shares of each symbol traded today, summed across trades
+    today_shares_by_symbol = {}
     for t in trades:
         sym = t["symbol"]
-        symbol_total_shares[sym] = symbol_total_shares.get(sym, 0) + t["total_entry_shares"]
+        today_shares_by_symbol[sym] = today_shares_by_symbol.get(sym, 0) + t.get("today_shares_traded", 0)
 
     for t in trades:
         sym = t["symbol"]
         fees = fee_by_symbol.get(sym)
-        # Commission: $0.0025 per share traded (both entry and exit)
-        total_shares_traded = t["total_entry_shares"] + t["total_exit_shares"]
-        t["commission"] = round(total_shares_traded * 0.0025, 6)
 
-        if not fees or symbol_total_shares.get(sym, 0) == 0:
-            t["ecn_fees"] = 0
-            t["sec_fees"] = 0
-            t["finra_fees"] = 0
-            t["htb_fees"] = 0
-            t["cat_fees"] = 0
-            t["net_pnl"] = round(t["gross_pnl"] - t["commission"], 2)
-            continue
+        # Commission covers every share traded across all days
+        all_shares = t["total_entry_shares"] + t["total_exit_shares"]
+        t["commission"] = round(all_shares * 0.0025, 6)
 
-        proportion = t["total_entry_shares"] / symbol_total_shares[sym]
-        t["ecn_fees"] = round(fees["ecn"] * proportion, 6)
-        t["sec_fees"] = round(fees["sec"] * proportion, 6)
-        t["finra_fees"] = round(fees["finra"] * proportion, 6)
-        t["htb_fees"] = round(fees["htb_fee"] * proportion, 6)
-        t["cat_fees"] = round(fees["cat_fee"] * proportion, 6)
+        # Start with prior-day fees already booked on the carry trade
+        prior = prior_fees_by_trade.get(t.get("carry", {}).get("trade_id"), {})
+        ecn   = prior.get("ecn_fees", 0.0)
+        sec   = prior.get("sec_fees", 0.0)
+        finra = prior.get("finra_fees", 0.0)
+        htb   = prior.get("htb_fees", 0.0)
+        cat   = prior.get("cat_fees", 0.0)
+
+        today_total = today_shares_by_symbol.get(sym, 0)
+        if fees and today_total > 0 and t.get("today_shares_traded", 0) > 0:
+            proportion = t["today_shares_traded"] / today_total
+            ecn   += fees["ecn"]     * proportion
+            sec   += fees["sec"]     * proportion
+            finra += fees["finra"]   * proportion
+            htb   += fees["htb_fee"] * proportion
+            cat   += fees["cat_fee"] * proportion
+
+        t["ecn_fees"]   = round(ecn, 6)
+        t["sec_fees"]   = round(sec, 6)
+        t["finra_fees"] = round(finra, 6)
+        t["htb_fees"]   = round(htb, 6)
+        t["cat_fees"]   = round(cat, 6)
 
         total_fees = (t["ecn_fees"] + t["sec_fees"] + t["finra_fees"]
                       + t["htb_fees"] + t["cat_fees"] + t["commission"])
@@ -450,24 +548,50 @@ def insert_fees(conn, fee_rows):
 
 
 def insert_trades(conn, trades, execution_ids):
-    """Insert consolidated trades and link to raw executions."""
-    for t in trades:
-        cur = conn.execute("""
-            INSERT OR REPLACE INTO trades
-            (date, symbol, direction, entry_time, exit_time,
-             entry_avg_price, exit_avg_price, total_entry_shares, total_exit_shares,
-             max_position, num_executions, gross_pnl, hold_time_seconds,
-             ecn_fees, sec_fees, finra_fees, htb_fees, cat_fees, commission, net_pnl, trade_index)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """, (t["date"], t["symbol"], t["direction"], t["entry_time"], t["exit_time"],
-              t["entry_avg_price"], t["exit_avg_price"], t["total_entry_shares"],
-              t["total_exit_shares"], t["max_position"], t["num_executions"],
-              t["gross_pnl"], t["hold_time_seconds"],
-              t["ecn_fees"], t["sec_fees"], t["finra_fees"], t["htb_fees"],
-              t["cat_fees"], t["commission"], t["net_pnl"], t["trade_index"]))
-        trade_id = cur.lastrowid
+    """Insert consolidated trades and link to raw executions.
 
-        # Link executions
+    Carry trades (those that absorbed a prior day's open position) UPDATE
+    the existing trade row in place, keeping its original id so the
+    trade_executions links from the prior day remain intact.
+    """
+    for t in trades:
+        carry = t.get("carry")
+        if carry:
+            trade_id = carry["trade_id"]
+            conn.execute("""
+                UPDATE trades SET
+                    direction=?, entry_time=?, exit_time=?,
+                    entry_avg_price=?, exit_avg_price=?,
+                    total_entry_shares=?, total_exit_shares=?,
+                    max_position=?, num_executions=?, gross_pnl=?,
+                    hold_time_seconds=?, ecn_fees=?, sec_fees=?, finra_fees=?,
+                    htb_fees=?, cat_fees=?, commission=?, net_pnl=?
+                WHERE id=?
+            """, (t["direction"], t["entry_time"], t["exit_time"],
+                  t["entry_avg_price"], t["exit_avg_price"],
+                  t["total_entry_shares"], t["total_exit_shares"],
+                  t["max_position"], t["num_executions"], t["gross_pnl"],
+                  t["hold_time_seconds"], t["ecn_fees"], t["sec_fees"],
+                  t["finra_fees"], t["htb_fees"], t["cat_fees"],
+                  t["commission"], t["net_pnl"], trade_id))
+        else:
+            cur = conn.execute("""
+                INSERT OR REPLACE INTO trades
+                (date, symbol, direction, entry_time, exit_time,
+                 entry_avg_price, exit_avg_price, total_entry_shares, total_exit_shares,
+                 max_position, num_executions, gross_pnl, hold_time_seconds,
+                 ecn_fees, sec_fees, finra_fees, htb_fees, cat_fees, commission, net_pnl, trade_index)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (t["date"], t["symbol"], t["direction"], t["entry_time"], t["exit_time"],
+                  t["entry_avg_price"], t["exit_avg_price"], t["total_entry_shares"],
+                  t["total_exit_shares"], t["max_position"], t["num_executions"],
+                  t["gross_pnl"], t["hold_time_seconds"],
+                  t["ecn_fees"], t["sec_fees"], t["finra_fees"], t["htb_fees"],
+                  t["cat_fees"], t["commission"], t["net_pnl"], t["trade_index"]))
+            trade_id = cur.lastrowid
+
+        # Link today's executions (carry trades already have their prior-day
+        # exec links from when the prior trade was inserted).
         for exec_idx in t["execution_indices"]:
             exec_id = execution_ids[exec_idx]
             if exec_id:
@@ -514,35 +638,57 @@ def process_day(conn, date_prefix):
         fee_rows = load_fees(str(ar_path), trade_date)
         print(f"  Loaded fees for {len(fee_rows)} symbols")
 
-    # Group into trades
-    trades = group_into_trades(executions, trade_date)
+    # Group into trades (passes conn so cross-day open positions can be stitched)
+    trades = group_into_trades(executions, trade_date, conn=conn)
     print(f"  Grouped into {len(trades)} trades:")
     for t in trades:
         status = " (UNCLOSED)" if t.get("unclosed") else ""
+        carry_tag = "  [+carry]" if t.get("carry") else ""
         print(f"    {t['symbol']:6s} {t['direction']:5s}  "
               f"{t['entry_time']}-{t['exit_time']}  "
               f"{t['total_entry_shares']:4d} shares  "
-              f"P&L: ${t['gross_pnl']:+.2f}{status}")
+              f"P&L: ${t['gross_pnl']:+.2f}{status}{carry_tag}")
 
-    # Allocate fees
-    if fee_rows:
-        allocate_fees(trades, fee_rows)
+    # For each carry trade, fetch the prior day's already-booked fees so we
+    # can preserve them on the merged row.
+    prior_fees_by_trade = {}
+    for t in trades:
+        carry = t.get("carry")
+        if not carry:
+            continue
+        row = conn.execute("""
+            SELECT ecn_fees, sec_fees, finra_fees, htb_fees, cat_fees
+            FROM trades WHERE id = ?
+        """, (carry["trade_id"],)).fetchone()
+        if row:
+            prior_fees_by_trade[carry["trade_id"]] = {
+                "ecn_fees": row[0] or 0.0, "sec_fees": row[1] or 0.0,
+                "finra_fees": row[2] or 0.0, "htb_fees": row[3] or 0.0,
+                "cat_fees": row[4] or 0.0,
+            }
+
+    allocate_fees(trades, fee_rows, prior_fees_by_trade=prior_fees_by_trade)
 
     # Insert into DB
     execution_ids = insert_executions(conn, executions)
     insert_fees(conn, fee_rows)
     insert_trades(conn, trades, execution_ids)
 
-    # Summary
+    # Summary — only count today's contribution. For carry trades, that means
+    # net change from what was booked on the prior trade row, but for a simple
+    # daily summary we still show the trade's full gross/net (matches old
+    # behavior on flat-day trades).
     total_gross = sum(t["gross_pnl"] for t in trades)
     total_net = sum(t.get("net_pnl", t["gross_pnl"]) for t in trades)
     total_fees = total_gross - total_net
     print(f"\n  Day summary: Gross ${total_gross:+.2f} | Fees ${total_fees:.2f} | Net ${total_net:+.2f}")
 
-    # Cross-check with AR file
-    # Note: AR "Day-trade P&L" already includes ECN + FINRA fees, so compare
-    # our gross minus those two fee types against the AR value
-    if fee_rows:
+    # Cross-check with AR file. Skip when this day has multi-day swing
+    # activity — either it absorbed a carry-forward position (P&L spans days)
+    # or it left an unclosed position (broker reports unrealized M2M in AR
+    # which won't match our $0 gross for the open trade).
+    has_swing = any(t.get("carry") or t.get("unclosed") for t in trades)
+    if fee_rows and not has_swing:
         ar_pnl = sum(fr["day_trade_pnl"] for fr in fee_rows)
         total_ecn = sum(fr["ecn"] for fr in fee_rows)
         total_finra = sum(fr["finra"] for fr in fee_rows)
