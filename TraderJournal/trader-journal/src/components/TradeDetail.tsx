@@ -143,7 +143,7 @@ export function TradeDetail({ trade, allTags = [], allTriggers = [], chartUrl, o
           />
           <MetricCard
             label="Acc %"
-            value={`${(trade["Acc %"] * 100).toFixed(2)}%`}
+            value={`${(trade["Acc %"] * 100).toFixed(0)}%`}
             className={trade["Acc %"] >= 0 ? "text-emerald-400" : "text-red-400"}
           />
         </div>
