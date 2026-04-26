@@ -2,4 +2,5 @@
 *.db
 data/
 *.xlsx
-*.bak
+*.bak 
+*.env

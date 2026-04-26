@@ -1,118 +1,66 @@
 """
-Trade Ingest Pipeline
-=====================
-Processes raw trade CSV files + fee reports (_AR) into a SQLite database.
+Trade Ingest Pipeline (Postgres)
+================================
+Processes raw trade CSV files + fee reports (_AR) into a Postgres database.
 
-Data:   Reads from SPTD 2026 folder:
-        M-D-YY.csv      (raw executions: time, symbol, side, price, qty, route, type)
-        M-D-YY_AR.csv   (account report: per-symbol fees and summary stats)
+Data:   Reads from the SPTD 2026 folder:
+        M-D-YY.csv          raw executions: time, symbol, side, price, qty, route, type
+        M-D-YY_AR.csv       per-symbol fees and broker stats
+        M-D-YY_locates.csv  per-day locates (date, symbol, shares, cost) — optional
+        locates.csv         consolidated all-time locates fallback
 
-Output: trades.db (in TradeIngest/) with tables:
-        - raw_executions  (every fill, append-only)
-        - trades          (consolidated: first entry → position back to 0)
-        - trade_executions (links each raw execution to its parent trade)
+Output: 5 tables in the `trades_db` Postgres database (created by db_setup.py):
+        - raw_executions    every fill, append-only
+        - trades            consolidated trades (entry -> flat). Cross-day stitched.
+        - trade_executions  links each raw execution to its parent trade
+        - daily_fees        per-symbol broker AR data
+        - locates           per-day locates (may include unused symbols)
+
+Connection settings come from TradeIngest/.env (PG_HOST, PG_PORT, PG_USER,
+PG_PASSWORD, PG_DB_TARGET — see db_setup.py).
 
 Usage:
-    python ingest_trades.py 3-27-26          # processes 3-27-26.csv and 3-27-26_AR.csv
-    python ingest_trades.py 3-27-26 3-28-26  # processes multiple days
-    python ingest_trades.py --all            # processes all CSV files in the directory
+    python ingest_trades.py 3-27-26              # one day
+    python ingest_trades.py 3-27-26 3-28-26      # multiple days
+    python ingest_trades.py --all                # all CSV files in DATA_DIR
+    python ingest_trades.py --force <dates>      # re-ingest a day (deletes & reloads)
+    python ingest_trades.py --show               # print all DB contents
+    python ingest_trades.py --show 2026-03-27    # one day
+    python ingest_trades.py --locates            # ingest consolidated locates.csv
 """
 
 import csv
-import sqlite3
-import sys
 import os
 import re
-from datetime import datetime, date
+import sys
+from datetime import datetime, date, time
+from io import StringIO
 from pathlib import Path
 
-DB_NAME = "trades.db"
+import psycopg2
+from dotenv import load_dotenv
+
 SCRIPT_DIR = Path(__file__).parent
+ENV_PATH = SCRIPT_DIR / ".env"
 DATA_DIR = Path(r"C:\Users\sspma\OneDrive\Desktop\Trading Statistics\Personal Stats and Expense Sheets\SPTD 2026")
+TARGET_DB = "trades_db"
 
 
 # ---------------------------------------------------------------------------
-# Database setup
+# Connection
 # ---------------------------------------------------------------------------
 
-def get_db(db_path=None):
-    if db_path is None:
-        db_path = SCRIPT_DIR / DB_NAME
-    conn = sqlite3.connect(str(db_path))
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA foreign_keys=ON")
-    create_tables(conn)
+def get_conn():
+    """Open a connection to the trades Postgres DB using .env config."""
+    load_dotenv(ENV_PATH)
+    conn = psycopg2.connect(
+        host=os.environ["PG_HOST"],
+        port=int(os.environ["PG_PORT"]),
+        user=os.environ["PG_USER"],
+        password=os.environ["PG_PASSWORD"],
+        dbname=TARGET_DB,
+    )
     return conn
-
-
-def create_tables(conn):
-    conn.executescript("""
-        CREATE TABLE IF NOT EXISTS raw_executions (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            date TEXT NOT NULL,              -- YYYY-MM-DD
-            time TEXT NOT NULL,              -- HH:MM:SS
-            symbol TEXT NOT NULL,
-            side TEXT NOT NULL,              -- SS, S, B
-            price REAL NOT NULL,
-            qty INTEGER NOT NULL,
-            route TEXT,
-            type TEXT,                       -- Short, Margin
-            UNIQUE(date, time, symbol, side, price, qty, route)
-        );
-
-        CREATE TABLE IF NOT EXISTS trades (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            date TEXT NOT NULL,              -- YYYY-MM-DD
-            symbol TEXT NOT NULL,
-            direction TEXT NOT NULL,         -- Short or Long
-            entry_time TEXT NOT NULL,        -- first execution time
-            exit_time TEXT NOT NULL,         -- last execution time
-            entry_avg_price REAL NOT NULL,   -- VWAP of entry fills
-            exit_avg_price REAL NOT NULL,    -- VWAP of exit fills
-            total_entry_shares INTEGER NOT NULL,
-            total_exit_shares INTEGER NOT NULL,
-            max_position INTEGER NOT NULL,   -- peak shares held
-            num_executions INTEGER NOT NULL,
-            gross_pnl REAL NOT NULL,
-            hold_time_seconds INTEGER,
-            -- fees (allocated from _AR file)
-            ecn_fees REAL DEFAULT 0,
-            sec_fees REAL DEFAULT 0,
-            finra_fees REAL DEFAULT 0,
-            htb_fees REAL DEFAULT 0,
-            cat_fees REAL DEFAULT 0,
-            commission REAL DEFAULT 0,   -- $0.0025 per share traded
-            net_pnl REAL DEFAULT 0,
-            trade_index INTEGER NOT NULL,    -- 1st, 2nd, 3rd trade on this symbol this day
-            UNIQUE(date, symbol, trade_index)
-        );
-
-        CREATE TABLE IF NOT EXISTS trade_executions (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            trade_id INTEGER NOT NULL REFERENCES trades(id),
-            execution_id INTEGER NOT NULL REFERENCES raw_executions(id),
-            UNIQUE(trade_id, execution_id)
-        );
-
-        CREATE TABLE IF NOT EXISTS daily_fees (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            date TEXT NOT NULL,
-            symbol TEXT NOT NULL,
-            trades_count INTEGER,
-            bought_shares INTEGER,
-            b_avg_price REAL,
-            sold_shares INTEGER,
-            s_avg_price REAL,
-            day_trade_pnl REAL,
-            ecn REAL DEFAULT 0,
-            sec REAL DEFAULT 0,
-            finra REAL DEFAULT 0,
-            htb_fee REAL DEFAULT 0,
-            cat_fee REAL DEFAULT 0,
-            UNIQUE(date, symbol)
-        );
-    """)
-    conn.commit()
 
 
 # ---------------------------------------------------------------------------
@@ -120,24 +68,31 @@ def create_tables(conn):
 # ---------------------------------------------------------------------------
 
 def parse_date_from_filename(filename):
-    """Convert M-D-YY filename to YYYY-MM-DD date string."""
-    base = filename.replace("_AR", "").replace(".csv", "")
+    """Convert M-D-YY filename to a `date` object."""
+    base = filename.replace("_AR", "").replace("_locates", "").replace(".csv", "")
     parts = base.split("-")
     if len(parts) != 3:
         raise ValueError(f"Cannot parse date from filename: {filename}")
     month, day, year = int(parts[0]), int(parts[1]), int(parts[2])
     year = 2000 + year if year < 100 else year
-    return date(year, month, day).isoformat()
+    return date(year, month, day)
 
 
 def parse_time(t):
-    """Normalize time string to HH:MM:SS."""
+    """Normalize time string to a `time` object."""
     parts = t.strip().split(":")
-    return f"{int(parts[0]):02d}:{int(parts[1]):02d}:{int(parts[2]):02d}"
+    return time(int(parts[0]), int(parts[1]), int(parts[2]))
+
+
+def parse_us_date(s):
+    """Parse 'M/D/YYYY' (locates.csv format) to date."""
+    s = s.strip()
+    m, d, y = s.split("/")
+    return date(int(y), int(m), int(d))
 
 
 def load_executions(csv_path, trade_date):
-    """Load raw execution CSV into list of dicts."""
+    """Load raw execution CSV into list of dicts (date/time as objects)."""
     rows = []
     with open(csv_path, "r", newline="") as f:
         reader = csv.DictReader(f)
@@ -154,38 +109,38 @@ def load_executions(csv_path, trade_date):
                 "route": row.get("Route", "").strip(),
                 "type": row.get("Type", "").strip(),
             })
-    # Sort by symbol then time for grouping
     rows.sort(key=lambda r: (r["symbol"], r["time"]))
     return rows
 
 
 def load_fees(ar_path, trade_date):
     """Load _AR fee report into list of dicts."""
-    rows = []
     with open(ar_path, "r", newline="") as f:
-        # The _AR file has multi-line headers due to quoted newlines; read raw
         content = f.read()
 
-    # Re-parse: the header has newlines inside quoted fields, so we need to
-    # handle it. Let's just split by newline and find the data rows.
-    lines = content.replace("\r\n", "\n").split("\n")
-
-    # Find the header line - it starts with "Symbol,"
-    # But the header may span multiple lines due to quoted fields with newlines.
-    # Let's use csv.reader which handles this properly.
-    from io import StringIO
     reader = csv.reader(StringIO(content))
     all_rows = list(reader)
-
     if not all_rows:
         return []
 
-    # First row is the header (may have been split across lines by csv.reader)
     header = all_rows[0]
-
-    # Clean up header names - remove newlines within field names
     clean_header = [h.replace("\r", "").replace("\n", " ").strip() for h in header]
 
+    def safe_float(d, key, default=0.0):
+        v = d.get(key, "")
+        try:
+            return float(v) if v else default
+        except ValueError:
+            return default
+
+    def safe_int(d, key, default=0):
+        v = d.get(key, "")
+        try:
+            return int(v) if v else default
+        except ValueError:
+            return default
+
+    rows = []
     for data_row in all_rows[1:]:
         if not data_row or not data_row[0].strip():
             continue
@@ -193,24 +148,7 @@ def load_fees(ar_path, trade_date):
         if symbol == "TOTAL":
             continue
 
-        row_dict = {}
-        for i, val in enumerate(data_row):
-            if i < len(clean_header):
-                row_dict[clean_header[i]] = val.strip()
-
-        def safe_float(d, key, default=0.0):
-            v = d.get(key, "")
-            try:
-                return float(v) if v else default
-            except ValueError:
-                return default
-
-        def safe_int(d, key, default=0):
-            v = d.get(key, "")
-            try:
-                return int(v) if v else default
-            except ValueError:
-                return default
+        row_dict = {clean_header[i]: v.strip() for i, v in enumerate(data_row) if i < len(clean_header)}
 
         rows.append({
             "date": trade_date,
@@ -230,63 +168,70 @@ def load_fees(ar_path, trade_date):
     return rows
 
 
+def load_locates_file(path):
+    """Load a locates CSV (Date, Symbol, Shares, Cost). Returns list of dicts."""
+    rows = []
+    with open(path, "r", newline="") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            if not row.get("Symbol", "").strip():
+                continue
+            rows.append({
+                "date": parse_us_date(row["Date"]),
+                "symbol": row["Symbol"].strip().upper(),
+                "shares": int(row["Shares"]),
+                "cost": float(row["Cost"]),
+            })
+    return rows
+
+
 # ---------------------------------------------------------------------------
-# Trade grouping algorithm
+# Trade grouping (cross-day aware)
 # ---------------------------------------------------------------------------
 
-def find_open_carry(conn, symbol, trade_date):
+def find_open_carry(cur, symbol, trade_date):
     """
     Look up the most recent trade for `symbol` strictly before `trade_date`.
-    If it's unclosed (entry_shares != exit_shares), return its raw executions
-    plus the trade row, so today's executions can be stitched onto it.
+    If unclosed (entry_shares != exit_shares), pull its raw executions so
+    today's executions can be stitched onto it.
     """
-    row = conn.execute("""
+    cur.execute("""
         SELECT id, date, entry_time, total_entry_shares, total_exit_shares
         FROM trades
-        WHERE symbol = ? AND date < ?
+        WHERE symbol = %s AND date < %s
         ORDER BY date DESC, entry_time DESC
         LIMIT 1
-    """, (symbol, trade_date)).fetchone()
+    """, (symbol, trade_date))
+    row = cur.fetchone()
     if not row:
         return None
     trade_id, prior_date, prior_entry, in_sh, out_sh = row
     if in_sh == out_sh:
-        return None  # already flat
+        return None
 
-    execs = conn.execute("""
+    cur.execute("""
         SELECT re.id, re.date, re.time, re.symbol, re.side, re.price, re.qty, re.route, re.type
         FROM raw_executions re
         JOIN trade_executions te ON te.execution_id = re.id
-        WHERE te.trade_id = ?
+        WHERE te.trade_id = %s
         ORDER BY re.date, re.time
-    """, (trade_id,)).fetchall()
-
+    """, (trade_id,))
     prior_execs = [{
         "_db_id": e[0], "date": e[1], "time": e[2], "symbol": e[3],
-        "side": e[4], "price": e[5], "qty": e[6], "route": e[7], "type": e[8],
-    } for e in execs]
+        "side": e[4], "price": float(e[5]), "qty": e[6], "route": e[7], "type": e[8],
+    } for e in cur.fetchall()]
 
     return {"trade_id": trade_id, "prior_date": prior_date,
             "prior_entry_time": prior_entry, "prior_execs": prior_execs}
 
 
-def group_into_trades(executions, trade_date, conn=None):
+def group_into_trades(executions, trade_date, cur=None):
     """
-    Group raw executions into trades.
-
-    A "trade" is all executions on a symbol from first entry until position
-    returns to zero. Partial covers, adds, scales — all part of the same trade.
-    Trades can span multiple days: if a prior day left an open position on a
-    symbol, today's executions are stitched onto that prior trade and the
-    trade is anchored to its original entry date.
-
-    Returns list of trade dicts. Each trade has:
-      - metadata (symbol, direction, times, prices, pnl)
-      - execution_indices: indices into today's `executions` list
-      - carry: optional dict with prior trade_id and prior raw-exec ids when
-        this trade absorbed a carry-forward position
+    Group raw executions into trades. A trade = first entry until position
+    returns to zero. Trades can span multiple days via cross-day stitching:
+    if a prior day left an open position, today's executions are appended
+    onto that prior trade and the trade is anchored to its original entry date.
     """
-    # Group today's executions by symbol
     by_symbol = {}
     for i, ex in enumerate(executions):
         by_symbol.setdefault(ex["symbol"], []).append((i, ex))
@@ -294,13 +239,10 @@ def group_into_trades(executions, trade_date, conn=None):
     trades = []
 
     for symbol, symbol_execs in sorted(by_symbol.items()):
-        # Check for carry-forward open position from a prior day
-        carry = find_open_carry(conn, symbol, trade_date) if conn is not None else None
+        carry = find_open_carry(cur, symbol, trade_date) if cur is not None else None
 
-        # Working list: (today_idx_or_None, execution_dict, signed_qty)
-        # For prior-day execs, today_idx is None and we stash the db id separately.
+        # working list: (today_idx_or_None, exec_dict, signed_qty)
         working = []
-
         if carry:
             for pex in carry["prior_execs"]:
                 signed = -pex["qty"] if pex["side"] in ("SS", "S") else pex["qty"]
@@ -310,10 +252,6 @@ def group_into_trades(executions, trade_date, conn=None):
             signed = -ex["qty"] if ex["side"] in ("SS", "S") else ex["qty"]
             working.append((idx, ex, signed))
 
-        # Walk and split into trades on each return-to-zero.
-        # trade_index is per (date, symbol). Carry trades keep their original
-        # index (set by the prior-day insert); today-only trades on this
-        # symbol number from 1.
         position = 0
         current = []
         today_trade_index = 0
@@ -327,7 +265,7 @@ def group_into_trades(executions, trade_date, conn=None):
                 is_carry = (carry and not first_carry_used
                             and any(e[0] is None for e in current))
                 if is_carry:
-                    trade = build_trade(symbol, trade_date, 0, current)  # index overwritten below
+                    trade = build_trade(symbol, trade_date, 0, current)
                     trade["date"] = carry["prior_date"]
                     trade["entry_time"] = carry["prior_entry_time"]
                     trade["carry"] = {
@@ -338,11 +276,9 @@ def group_into_trades(executions, trade_date, conn=None):
                 else:
                     today_trade_index += 1
                     trade = build_trade(symbol, trade_date, today_trade_index, current)
-
                 trades.append(trade)
                 current = []
 
-        # Handle unclosed leftover
         if current:
             is_carry = (carry and not first_carry_used
                         and any(e[0] is None for e in current))
@@ -367,8 +303,6 @@ def group_into_trades(executions, trade_date, conn=None):
 
 def build_trade(symbol, trade_date, trade_index, trade_execs):
     """Build a trade summary dict from a list of (idx, execution, signed_qty) tuples."""
-
-    # Separate entries and exits based on the first execution's direction
     first_signed = trade_execs[0][2]
     if first_signed < 0:
         direction = "Short"
@@ -378,9 +312,8 @@ def build_trade(symbol, trade_date, trade_index, trade_execs):
         entry_side = ("B",)
 
     entries = [(idx, ex) for idx, ex, sq in trade_execs if ex["side"] in entry_side]
-    exits = [(idx, ex) for idx, ex, sq in trade_execs if ex["side"] not in entry_side]
+    exits   = [(idx, ex) for idx, ex, sq in trade_execs if ex["side"] not in entry_side]
 
-    # VWAP calculations
     entry_total_cost = sum(ex["price"] * ex["qty"] for _, ex in entries)
     entry_total_shares = sum(ex["qty"] for _, ex in entries)
     exit_total_cost = sum(ex["price"] * ex["qty"] for _, ex in exits)
@@ -389,45 +322,37 @@ def build_trade(symbol, trade_date, trade_index, trade_execs):
     entry_vwap = entry_total_cost / entry_total_shares if entry_total_shares else 0
     exit_vwap = exit_total_cost / exit_total_shares if exit_total_shares else 0
 
-    # Gross P&L
     if direction == "Short":
-        # Shorted at entry_vwap, covered at exit_vwap
         gross_pnl = (entry_vwap - exit_vwap) * exit_total_shares
     else:
-        # Bought at entry_vwap, sold at exit_vwap
         gross_pnl = (exit_vwap - entry_vwap) * exit_total_shares
 
-    # Times — use (date, time) so cross-day trades pick the earliest/latest
-    # execution chronologically rather than just by clock.
+    # Cross-day-aware times: sort by (date, time)
     keyed_times = sorted([(ex["date"], ex["time"]) for _, ex, _ in trade_execs])
-    entry_date, entry_time = keyed_times[0]
-    exit_date, exit_time = keyed_times[-1]
+    entry_date, entry_time_v = keyed_times[0]
+    exit_date, exit_time_v = keyed_times[-1]
 
-    # Hold time across days
     try:
-        t1 = datetime.strptime(f"{entry_date} {entry_time}", "%Y-%m-%d %H:%M:%S")
-        t2 = datetime.strptime(f"{exit_date} {exit_time}", "%Y-%m-%d %H:%M:%S")
+        t1 = datetime.combine(entry_date, entry_time_v)
+        t2 = datetime.combine(exit_date, exit_time_v)
         hold_seconds = int((t2 - t1).total_seconds())
     except Exception:
         hold_seconds = 0
 
-    # Max position (peak absolute position during the trade)
     running = 0
     max_pos = 0
     for _, ex, sq in trade_execs:
         running += sq
         max_pos = max(max_pos, abs(running))
 
-    # Shares traded *today* (excludes carry-forward executions from prior days).
-    # Carry execs have idx=None; today's execs have an integer idx.
     today_shares_traded = sum(ex["qty"] for idx, ex, _ in trade_execs if idx is not None)
 
     return {
         "date": trade_date,
         "symbol": symbol,
         "direction": direction,
-        "entry_time": entry_time,
-        "exit_time": exit_time,
+        "entry_time": entry_time_v,
+        "exit_time": exit_time_v,
         "entry_avg_price": round(entry_vwap, 6),
         "exit_avg_price": round(exit_vwap, 6),
         "total_entry_shares": entry_total_shares,
@@ -449,20 +374,13 @@ def build_trade(symbol, trade_date, trade_index, trade_execs):
 
 def allocate_fees(trades, fee_rows, prior_fees_by_trade=None):
     """
-    Allocate daily per-symbol fees proportionally across trades on that symbol.
-
-    Today's fees (from `fee_rows`) are split in proportion to each trade's
-    today-traded shares (entry + exit done on this trading day). For trades
-    that absorbed a carry-forward position, `prior_fees_by_trade` supplies
-    the fees already booked on the prior day's trade row, which are added
-    on top of today's allocation.
-
-    Commission is $0.0025 per share traded across all days of the trade.
+    Today's fees split across trades on the symbol in proportion to today's
+    shares traded. Carry trades inherit the prior-day fee booking on top.
+    Commission = $0.0025 per share traded across all days.
     """
     fee_by_symbol = {fr["symbol"]: fr for fr in fee_rows}
     prior_fees_by_trade = prior_fees_by_trade or {}
 
-    # How many shares of each symbol traded today, summed across trades
     today_shares_by_symbol = {}
     for t in trades:
         sym = t["symbol"]
@@ -472,11 +390,9 @@ def allocate_fees(trades, fee_rows, prior_fees_by_trade=None):
         sym = t["symbol"]
         fees = fee_by_symbol.get(sym)
 
-        # Commission covers every share traded across all days
         all_shares = t["total_entry_shares"] + t["total_exit_shares"]
         t["commission"] = round(all_shares * 0.0025, 6)
 
-        # Start with prior-day fees already booked on the carry trade
         prior = prior_fees_by_trade.get(t.get("carry", {}).get("trade_id"), {})
         ecn   = prior.get("ecn_fees", 0.0)
         sec   = prior.get("sec_fees", 0.0)
@@ -505,68 +421,79 @@ def allocate_fees(trades, fee_rows, prior_fees_by_trade=None):
 
 
 # ---------------------------------------------------------------------------
-# Database insertion
+# DB inserts
 # ---------------------------------------------------------------------------
 
-def insert_executions(conn, executions):
-    """Insert raw executions, returning list of row IDs (matching input order)."""
+def insert_executions(cur, executions):
+    """Insert raw executions, returning a list of row IDs (input order)."""
     ids = []
     for ex in executions:
-        cur = conn.execute("""
-            INSERT OR IGNORE INTO raw_executions (date, time, symbol, side, price, qty, route, type)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        cur.execute("""
+            INSERT INTO raw_executions (date, time, symbol, side, price, qty, route, type)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+            ON CONFLICT (date, time, symbol, side, price, qty, route) DO NOTHING
+            RETURNING id
         """, (ex["date"], ex["time"], ex["symbol"], ex["side"],
               ex["price"], ex["qty"], ex["route"], ex["type"]))
-
-        if cur.lastrowid:
-            ids.append(cur.lastrowid)
+        row = cur.fetchone()
+        if row:
+            ids.append(row[0])
         else:
-            # Already existed, fetch the id
-            row = conn.execute("""
+            cur.execute("""
                 SELECT id FROM raw_executions
-                WHERE date=? AND time=? AND symbol=? AND side=? AND price=? AND qty=? AND route=?
+                WHERE date=%s AND time=%s AND symbol=%s AND side=%s
+                  AND price=%s AND qty=%s AND route=%s
             """, (ex["date"], ex["time"], ex["symbol"], ex["side"],
-                  ex["price"], ex["qty"], ex["route"])).fetchone()
-            ids.append(row[0] if row else None)
-    conn.commit()
+                  ex["price"], ex["qty"], ex["route"]))
+            r = cur.fetchone()
+            ids.append(r[0] if r else None)
     return ids
 
 
-def insert_fees(conn, fee_rows):
-    """Insert daily fee records."""
+def insert_fees(cur, fee_rows):
+    """Insert daily AR fee rows, replacing any existing row for the same (date, symbol)."""
     for fr in fee_rows:
-        conn.execute("""
-            INSERT OR REPLACE INTO daily_fees
-            (date, symbol, trades_count, bought_shares, b_avg_price, sold_shares,
-             s_avg_price, day_trade_pnl, ecn, sec, finra, htb_fee, cat_fee)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        cur.execute("""
+            INSERT INTO daily_fees
+                (date, symbol, trades_count, bought_shares, b_avg_price,
+                 sold_shares, s_avg_price, day_trade_pnl, ecn, sec, finra, htb_fee, cat_fee)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            ON CONFLICT (date, symbol) DO UPDATE SET
+                trades_count  = EXCLUDED.trades_count,
+                bought_shares = EXCLUDED.bought_shares,
+                b_avg_price   = EXCLUDED.b_avg_price,
+                sold_shares   = EXCLUDED.sold_shares,
+                s_avg_price   = EXCLUDED.s_avg_price,
+                day_trade_pnl = EXCLUDED.day_trade_pnl,
+                ecn           = EXCLUDED.ecn,
+                sec           = EXCLUDED.sec,
+                finra         = EXCLUDED.finra,
+                htb_fee       = EXCLUDED.htb_fee,
+                cat_fee       = EXCLUDED.cat_fee
         """, (fr["date"], fr["symbol"], fr["trades_count"], fr["bought_shares"],
               fr["b_avg_price"], fr["sold_shares"], fr["s_avg_price"],
               fr["day_trade_pnl"], fr["ecn"], fr["sec"], fr["finra"],
               fr["htb_fee"], fr["cat_fee"]))
-    conn.commit()
 
 
-def insert_trades(conn, trades, execution_ids):
-    """Insert consolidated trades and link to raw executions.
-
-    Carry trades (those that absorbed a prior day's open position) UPDATE
-    the existing trade row in place, keeping its original id so the
-    trade_executions links from the prior day remain intact.
+def insert_trades(cur, trades, execution_ids):
+    """
+    Insert consolidated trades and link to raw executions. Carry trades are
+    UPDATEd in place to keep their original id (and prior trade_executions links).
     """
     for t in trades:
         carry = t.get("carry")
         if carry:
             trade_id = carry["trade_id"]
-            conn.execute("""
+            cur.execute("""
                 UPDATE trades SET
-                    direction=?, entry_time=?, exit_time=?,
-                    entry_avg_price=?, exit_avg_price=?,
-                    total_entry_shares=?, total_exit_shares=?,
-                    max_position=?, num_executions=?, gross_pnl=?,
-                    hold_time_seconds=?, ecn_fees=?, sec_fees=?, finra_fees=?,
-                    htb_fees=?, cat_fees=?, commission=?, net_pnl=?
-                WHERE id=?
+                    direction=%s, entry_time=%s, exit_time=%s,
+                    entry_avg_price=%s, exit_avg_price=%s,
+                    total_entry_shares=%s, total_exit_shares=%s,
+                    max_position=%s, num_executions=%s, gross_pnl=%s,
+                    hold_time_seconds=%s, ecn_fees=%s, sec_fees=%s, finra_fees=%s,
+                    htb_fees=%s, cat_fees=%s, commission=%s, net_pnl=%s
+                WHERE id=%s
             """, (t["direction"], t["entry_time"], t["exit_time"],
                   t["entry_avg_price"], t["exit_avg_price"],
                   t["total_entry_shares"], t["total_exit_shares"],
@@ -575,42 +502,77 @@ def insert_trades(conn, trades, execution_ids):
                   t["finra_fees"], t["htb_fees"], t["cat_fees"],
                   t["commission"], t["net_pnl"], trade_id))
         else:
-            cur = conn.execute("""
-                INSERT OR REPLACE INTO trades
-                (date, symbol, direction, entry_time, exit_time,
-                 entry_avg_price, exit_avg_price, total_entry_shares, total_exit_shares,
-                 max_position, num_executions, gross_pnl, hold_time_seconds,
-                 ecn_fees, sec_fees, finra_fees, htb_fees, cat_fees, commission, net_pnl, trade_index)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            cur.execute("""
+                INSERT INTO trades
+                    (date, symbol, direction, entry_time, exit_time,
+                     entry_avg_price, exit_avg_price, total_entry_shares, total_exit_shares,
+                     max_position, num_executions, gross_pnl, hold_time_seconds,
+                     ecn_fees, sec_fees, finra_fees, htb_fees, cat_fees, commission, net_pnl, trade_index)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+                        %s, %s, %s, %s, %s, %s, %s, %s)
+                ON CONFLICT (date, symbol, trade_index) DO UPDATE SET
+                    direction          = EXCLUDED.direction,
+                    entry_time         = EXCLUDED.entry_time,
+                    exit_time          = EXCLUDED.exit_time,
+                    entry_avg_price    = EXCLUDED.entry_avg_price,
+                    exit_avg_price     = EXCLUDED.exit_avg_price,
+                    total_entry_shares = EXCLUDED.total_entry_shares,
+                    total_exit_shares  = EXCLUDED.total_exit_shares,
+                    max_position       = EXCLUDED.max_position,
+                    num_executions     = EXCLUDED.num_executions,
+                    gross_pnl          = EXCLUDED.gross_pnl,
+                    hold_time_seconds  = EXCLUDED.hold_time_seconds,
+                    ecn_fees           = EXCLUDED.ecn_fees,
+                    sec_fees           = EXCLUDED.sec_fees,
+                    finra_fees         = EXCLUDED.finra_fees,
+                    htb_fees           = EXCLUDED.htb_fees,
+                    cat_fees           = EXCLUDED.cat_fees,
+                    commission         = EXCLUDED.commission,
+                    net_pnl            = EXCLUDED.net_pnl
+                RETURNING id
             """, (t["date"], t["symbol"], t["direction"], t["entry_time"], t["exit_time"],
                   t["entry_avg_price"], t["exit_avg_price"], t["total_entry_shares"],
                   t["total_exit_shares"], t["max_position"], t["num_executions"],
                   t["gross_pnl"], t["hold_time_seconds"],
                   t["ecn_fees"], t["sec_fees"], t["finra_fees"], t["htb_fees"],
                   t["cat_fees"], t["commission"], t["net_pnl"], t["trade_index"]))
-            trade_id = cur.lastrowid
+            trade_id = cur.fetchone()[0]
 
-        # Link today's executions (carry trades already have their prior-day
-        # exec links from when the prior trade was inserted).
         for exec_idx in t["execution_indices"]:
             exec_id = execution_ids[exec_idx]
             if exec_id:
-                conn.execute("""
-                    INSERT OR IGNORE INTO trade_executions (trade_id, execution_id)
-                    VALUES (?, ?)
+                cur.execute("""
+                    INSERT INTO trade_executions (trade_id, execution_id)
+                    VALUES (%s, %s)
+                    ON CONFLICT (trade_id, execution_id) DO NOTHING
                 """, (trade_id, exec_id))
 
-    conn.commit()
+
+def insert_locates(cur, locate_rows):
+    """Insert locate rows; duplicates (same date/symbol/shares/cost) are ignored."""
+    if not locate_rows:
+        return 0
+    inserted = 0
+    for r in locate_rows:
+        cur.execute("""
+            INSERT INTO locates (date, symbol, shares, cost)
+            VALUES (%s, %s, %s, %s)
+            ON CONFLICT (date, symbol, shares, cost) DO NOTHING
+        """, (r["date"], r["symbol"], r["shares"], r["cost"]))
+        if cur.rowcount > 0:
+            inserted += 1
+    return inserted
 
 
 # ---------------------------------------------------------------------------
 # Main pipeline
 # ---------------------------------------------------------------------------
 
-def process_day(conn, date_prefix):
-    """Process one trading day given its file prefix (e.g., '3-27-26')."""
+def process_day(conn, date_prefix, force=False):
+    """Process one trading day. Wraps everything in a single transaction."""
     csv_path = DATA_DIR / f"{date_prefix}.csv"
     ar_path = DATA_DIR / f"{date_prefix}_AR.csv"
+    locates_path = DATA_DIR / f"{date_prefix}_locates.csv"
 
     if not csv_path.exists():
         print(f"  ERROR: {csv_path} not found, skipping.")
@@ -621,203 +583,218 @@ def process_day(conn, date_prefix):
     trade_date = parse_date_from_filename(date_prefix + ".csv")
     print(f"\n  Processing {date_prefix} -> {trade_date}")
 
-    # Check if already ingested
-    existing = conn.execute(
-        "SELECT COUNT(*) FROM raw_executions WHERE date = ?", (trade_date,)
-    ).fetchone()[0]
-    if existing > 0:
-        print(f"  Already ingested ({existing} executions). Skipping. Use --force to re-process.")
+    try:
+        with conn:  # commits on success, rolls back on exception
+            with conn.cursor() as cur:
+                if force:
+                    cur.execute("DELETE FROM trade_executions WHERE trade_id IN (SELECT id FROM trades WHERE date=%s)", (trade_date,))
+                    cur.execute("DELETE FROM trades WHERE date=%s", (trade_date,))
+                    cur.execute("DELETE FROM raw_executions WHERE date=%s", (trade_date,))
+                    cur.execute("DELETE FROM daily_fees WHERE date=%s", (trade_date,))
+                    cur.execute("DELETE FROM locates WHERE date=%s", (trade_date,))
+                    print("  Cleared existing data for this date (--force)")
+
+                cur.execute("SELECT COUNT(*) FROM raw_executions WHERE date = %s", (trade_date,))
+                existing = cur.fetchone()[0]
+                if existing > 0:
+                    print(f"  Already ingested ({existing} executions). Skipping. Use --force to re-process.")
+                    return True
+
+                executions = load_executions(str(csv_path), trade_date)
+                print(f"  Loaded {len(executions)} raw executions")
+
+                fee_rows = []
+                if ar_path.exists():
+                    fee_rows = load_fees(str(ar_path), trade_date)
+                    print(f"  Loaded fees for {len(fee_rows)} symbols")
+
+                locate_rows = []
+                if locates_path.exists():
+                    locate_rows = load_locates_file(str(locates_path))
+                    print(f"  Loaded {len(locate_rows)} locates")
+
+                trades = group_into_trades(executions, trade_date, cur=cur)
+                print(f"  Grouped into {len(trades)} trades:")
+                for t in trades:
+                    status = " (UNCLOSED)" if t.get("unclosed") else ""
+                    carry_tag = "  [+carry]" if t.get("carry") else ""
+                    print(f"    {t['symbol']:6s} {t['direction']:5s}  "
+                          f"{t['entry_time']}-{t['exit_time']}  "
+                          f"{t['total_entry_shares']:4d} shares  "
+                          f"P&L: ${t['gross_pnl']:+.2f}{status}{carry_tag}")
+
+                # Carry-trade prior fees
+                prior_fees_by_trade = {}
+                for t in trades:
+                    carry = t.get("carry")
+                    if not carry:
+                        continue
+                    cur.execute("""
+                        SELECT ecn_fees, sec_fees, finra_fees, htb_fees, cat_fees
+                        FROM trades WHERE id = %s
+                    """, (carry["trade_id"],))
+                    row = cur.fetchone()
+                    if row:
+                        prior_fees_by_trade[carry["trade_id"]] = {
+                            "ecn_fees": float(row[0] or 0), "sec_fees": float(row[1] or 0),
+                            "finra_fees": float(row[2] or 0), "htb_fees": float(row[3] or 0),
+                            "cat_fees": float(row[4] or 0),
+                        }
+
+                allocate_fees(trades, fee_rows, prior_fees_by_trade=prior_fees_by_trade)
+
+                execution_ids = insert_executions(cur, executions)
+                insert_fees(cur, fee_rows)
+                insert_trades(cur, trades, execution_ids)
+                if locate_rows:
+                    n = insert_locates(cur, locate_rows)
+                    print(f"  Inserted {n} new locate rows")
+
+                total_gross = sum(t["gross_pnl"] for t in trades)
+                total_net = sum(t.get("net_pnl", t["gross_pnl"]) for t in trades)
+                total_fees = total_gross - total_net
+                print(f"\n  Day summary: Gross ${total_gross:+.2f} | Fees ${total_fees:.2f} | Net ${total_net:+.2f}")
+
+                # Cross-check vs AR file (skip on swing days)
+                has_swing = any(t.get("carry") or t.get("unclosed") for t in trades)
+                if fee_rows and not has_swing:
+                    ar_pnl = sum(fr["day_trade_pnl"] for fr in fee_rows)
+                    total_ecn = sum(fr["ecn"] for fr in fee_rows)
+                    total_finra = sum(fr["finra"] for fr in fee_rows)
+                    comparable = total_gross - total_ecn - total_finra
+                    diff = abs(comparable - ar_pnl)
+                    if diff > 0.05:
+                        print(f"  WARNING: P&L mismatch vs AR file: ours=${comparable:+.2f} AR=${ar_pnl:+.2f} diff=${diff:.2f}")
+                    else:
+                        print(f"  OK: P&L matches AR file (${ar_pnl:+.2f})")
         return True
-
-    # Load data
-    executions = load_executions(str(csv_path), trade_date)
-    print(f"  Loaded {len(executions)} raw executions")
-
-    fee_rows = []
-    if ar_path.exists():
-        fee_rows = load_fees(str(ar_path), trade_date)
-        print(f"  Loaded fees for {len(fee_rows)} symbols")
-
-    # Group into trades (passes conn so cross-day open positions can be stitched)
-    trades = group_into_trades(executions, trade_date, conn=conn)
-    print(f"  Grouped into {len(trades)} trades:")
-    for t in trades:
-        status = " (UNCLOSED)" if t.get("unclosed") else ""
-        carry_tag = "  [+carry]" if t.get("carry") else ""
-        print(f"    {t['symbol']:6s} {t['direction']:5s}  "
-              f"{t['entry_time']}-{t['exit_time']}  "
-              f"{t['total_entry_shares']:4d} shares  "
-              f"P&L: ${t['gross_pnl']:+.2f}{status}{carry_tag}")
-
-    # For each carry trade, fetch the prior day's already-booked fees so we
-    # can preserve them on the merged row.
-    prior_fees_by_trade = {}
-    for t in trades:
-        carry = t.get("carry")
-        if not carry:
-            continue
-        row = conn.execute("""
-            SELECT ecn_fees, sec_fees, finra_fees, htb_fees, cat_fees
-            FROM trades WHERE id = ?
-        """, (carry["trade_id"],)).fetchone()
-        if row:
-            prior_fees_by_trade[carry["trade_id"]] = {
-                "ecn_fees": row[0] or 0.0, "sec_fees": row[1] or 0.0,
-                "finra_fees": row[2] or 0.0, "htb_fees": row[3] or 0.0,
-                "cat_fees": row[4] or 0.0,
-            }
-
-    allocate_fees(trades, fee_rows, prior_fees_by_trade=prior_fees_by_trade)
-
-    # Insert into DB
-    execution_ids = insert_executions(conn, executions)
-    insert_fees(conn, fee_rows)
-    insert_trades(conn, trades, execution_ids)
-
-    # Summary — only count today's contribution. For carry trades, that means
-    # net change from what was booked on the prior trade row, but for a simple
-    # daily summary we still show the trade's full gross/net (matches old
-    # behavior on flat-day trades).
-    total_gross = sum(t["gross_pnl"] for t in trades)
-    total_net = sum(t.get("net_pnl", t["gross_pnl"]) for t in trades)
-    total_fees = total_gross - total_net
-    print(f"\n  Day summary: Gross ${total_gross:+.2f} | Fees ${total_fees:.2f} | Net ${total_net:+.2f}")
-
-    # Cross-check with AR file. Skip when this day has multi-day swing
-    # activity — either it absorbed a carry-forward position (P&L spans days)
-    # or it left an unclosed position (broker reports unrealized M2M in AR
-    # which won't match our $0 gross for the open trade).
-    has_swing = any(t.get("carry") or t.get("unclosed") for t in trades)
-    if fee_rows and not has_swing:
-        ar_pnl = sum(fr["day_trade_pnl"] for fr in fee_rows)
-        total_ecn = sum(fr["ecn"] for fr in fee_rows)
-        total_finra = sum(fr["finra"] for fr in fee_rows)
-        comparable = total_gross - total_ecn - total_finra
-        diff = abs(comparable - ar_pnl)
-        if diff > 0.05:
-            print(f"  WARNING: P&L mismatch vs AR file: ours=${comparable:+.2f} AR=${ar_pnl:+.2f} diff=${diff:.2f}")
-        else:
-            print(f"  OK: P&L matches AR file (${ar_pnl:+.2f})")
-
-    return True
+    except Exception as e:
+        print(f"  FAILED, transaction rolled back: {e}")
+        raise
 
 
 def find_all_date_prefixes():
-    """Find all M-D-YY.csv files (not _AR) in the script directory."""
+    """Find all M-D-YY.csv files (not _AR, not _locates) in DATA_DIR."""
     prefixes = []
     for f in DATA_DIR.glob("*.csv"):
         name = f.stem
-        if name.endswith("_AR"):
+        if name.endswith("_AR") or name.endswith("_locates"):
             continue
-        # Check it looks like a date: digits-digits-digits
         if re.match(r"^\d{1,2}-\d{1,2}-\d{2,4}$", name):
             prefixes.append(name)
     prefixes.sort(key=lambda p: parse_date_from_filename(p + ".csv"))
     return prefixes
 
 
+# ---------------------------------------------------------------------------
+# Locates (consolidated file)
+# ---------------------------------------------------------------------------
+
+def ingest_consolidated_locates():
+    """Load locates.csv into the locates table. Tries DATA_DIR first, then
+    the local TradeIngest/SPTD 2026/ folder as a fallback."""
+    candidates = [
+        DATA_DIR / "locates.csv",
+        SCRIPT_DIR / "SPTD 2026" / "locates.csv",
+    ]
+    path = next((p for p in candidates if p.exists()), None)
+    if path is None:
+        print(f"  ERROR: locates.csv not found in any of: {[str(p) for p in candidates]}")
+        return False
+    rows = load_locates_file(str(path))
+    print(f"  Loaded {len(rows)} locates from {path}")
+    conn = get_conn()
+    try:
+        with conn, conn.cursor() as cur:
+            n = insert_locates(cur, rows)
+            print(f"  Inserted {n} new rows ({len(rows) - n} already existed)")
+    finally:
+        conn.close()
+    return True
+
+
+# ---------------------------------------------------------------------------
+# Reporting
+# ---------------------------------------------------------------------------
+
 def show_db(date_filter=None):
     """Print all DB contents to console."""
-    conn = get_db()
-    where = f"WHERE date = '{date_filter}'" if date_filter else ""
+    conn = get_conn()
+    where = "WHERE date = %s" if date_filter else ""
+    params = (date_filter,) if date_filter else ()
 
-    # --- Raw Executions ---
-    rows = conn.execute(f"""
-        SELECT date, time, symbol, side, price, qty, route, type
-        FROM raw_executions {where}
-        ORDER BY date, symbol, time
-    """).fetchall()
-    print(f"\n{'='*80}")
-    print(f"RAW EXECUTIONS ({len(rows)} rows)")
-    print(f"{'='*80}")
-    print(f"{'Date':<12s} {'Time':<10s} {'Symbol':<7s} {'Side':<5s} {'Price':>8s} {'Qty':>5s} {'Route':<7s} {'Type':<7s}")
-    print("-" * 80)
-    for r in rows:
-        print(f"{r[0]:<12s} {r[1]:<10s} {r[2]:<7s} {r[3]:<5s} {r[4]:8.4f} {r[5]:5d} {r[6]:<7s} {r[7]:<7s}")
+    try:
+        with conn.cursor() as cur:
+            cur.execute(f"""
+                SELECT date, time, symbol, side, price, qty, route, type
+                FROM raw_executions {where}
+                ORDER BY date, symbol, time
+            """, params)
+            rows = cur.fetchall()
+            print(f"\n{'='*80}\nRAW EXECUTIONS ({len(rows)} rows)\n{'='*80}")
+            for r in rows:
+                print(f"  {r[0]} {r[1]} {r[2]:6s} {r[3]:3s} {float(r[4]):8.4f} x {r[5]:5d}  {r[6]:<7s} {r[7]:<7s}")
 
-    # --- Trades ---
-    rows = conn.execute(f"""
-        SELECT date, symbol, direction, trade_index, entry_time, exit_time,
-               entry_avg_price, exit_avg_price, total_entry_shares, max_position,
-               num_executions, hold_time_seconds, gross_pnl, net_pnl,
-               ecn_fees, sec_fees, finra_fees, htb_fees, cat_fees, commission
-        FROM trades {where}
-        ORDER BY date, entry_time
-    """).fetchall()
-    print(f"\n{'='*80}")
-    print(f"TRADES ({len(rows)} rows)")
-    print(f"{'='*80}")
-    print(f"{'Date':<12s} {'Sym':<6s} {'Dir':<6s} {'#':>2s} {'Entry':>8s} {'Exit':>8s} "
-          f"{'EntPx':>8s} {'ExPx':>8s} {'Shares':>6s} {'MaxPos':>6s} {'#Exec':>5s} "
-          f"{'Hold':>6s} {'Gross':>9s} {'Net':>9s}")
-    print("-" * 110)
-    for r in rows:
-        hold = f"{r[11]//60}:{r[11]%60:02d}" if r[11] else "0:00"
-        print(f"{r[0]:<12s} {r[1]:<6s} {r[2]:<6s} {r[3]:2.0f} {r[4]:>8s} {r[5]:>8s} "
-              f"{r[6]:8.4f} {r[7]:8.4f} {r[8]:6.0f} {r[9]:6.0f} {r[10]:5.0f} "
-              f"{hold:>6s} {r[12]:+9.2f} {r[13]:+9.2f}")
+            cur.execute(f"""
+                SELECT date, symbol, direction, trade_index, entry_time, exit_time,
+                       entry_avg_price, exit_avg_price, total_entry_shares,
+                       num_executions, hold_time_seconds, gross_pnl, net_pnl
+                FROM trades {where}
+                ORDER BY date, entry_time
+            """, params)
+            rows = cur.fetchall()
+            print(f"\n{'='*80}\nTRADES ({len(rows)} rows)\n{'='*80}")
+            for r in rows:
+                hold = f"{r[10]//60}:{r[10]%60:02d}" if r[10] else "0:00"
+                print(f"  {r[0]} {r[1]:6s} {r[2]:5s} #{r[3]} "
+                      f"{r[4]}->{r[5]}  "
+                      f"{float(r[6]):8.4f}/{float(r[7]):8.4f}  "
+                      f"shr={r[8]:5d} execs={r[9]:3d} hold={hold:>6s}  "
+                      f"gross={float(r[11]):+9.2f} net={float(r[12]):+9.2f}")
 
-    # --- Fee breakdown per trade ---
-    print(f"\n{'='*80}")
-    print("FEE BREAKDOWN PER TRADE")
-    print(f"{'='*80}")
-    print(f"{'Date':<12s} {'Sym':<6s} {'#':>2s} {'ECN':>8s} {'SEC':>8s} {'FINRA':>8s} {'HTB':>8s} {'CAT':>8s} {'Comm':>8s} {'TotFee':>9s}")
-    print("-" * 90)
-    for r in rows:
-        total_fee = r[14] + r[15] + r[16] + r[17] + r[18] + r[19]
-        print(f"{r[0]:<12s} {r[1]:<6s} {r[3]:2.0f} {r[14]:8.4f} {r[15]:8.4f} {r[16]:8.4f} {r[17]:8.4f} {r[18]:8.4f} {r[19]:8.4f} {total_fee:+9.4f}")
+            cur.execute(f"""
+                SELECT date, symbol, shares, cost FROM locates {where}
+                ORDER BY date, symbol
+            """, params)
+            rows = cur.fetchall()
+            print(f"\n{'='*80}\nLOCATES ({len(rows)} rows)\n{'='*80}")
+            for r in rows:
+                print(f"  {r[0]} {r[1]:6s} shares={r[2]:5d} cost=${float(r[3]):.4f}")
 
-    # --- Daily Fees ---
-    rows = conn.execute(f"""
-        SELECT date, symbol, trades_count, bought_shares, b_avg_price,
-               sold_shares, s_avg_price, day_trade_pnl, ecn, sec, finra, htb_fee, cat_fee
-        FROM daily_fees {where}
-        ORDER BY date, symbol
-    """).fetchall()
-    print(f"\n{'='*80}")
-    print(f"DAILY FEES from AR file ({len(rows)} rows)")
-    print(f"{'='*80}")
-    print(f"{'Date':<12s} {'Sym':<6s} {'Trades':>6s} {'BShrs':>6s} {'BAvg':>8s} {'SShrs':>6s} {'SAvg':>8s} "
-          f"{'DayPnL':>9s} {'ECN':>8s} {'SEC':>6s} {'FINRA':>7s} {'HTB':>8s} {'CAT':>6s}")
-    print("-" * 110)
-    for r in rows:
-        print(f"{r[0]:<12s} {r[1]:<6s} {r[2]:6d} {r[3]:6d} {r[4]:8.4f} {r[5]:6d} {r[6]:8.4f} "
-              f"{r[7]:+9.2f} {r[8]:8.4f} {r[9]:6.4f} {r[10]:7.4f} {r[11]:8.4f} {r[12]:6.4f}")
+            cur.execute(f"""
+                SELECT date, COUNT(*), SUM(gross_pnl), SUM(net_pnl),
+                       SUM(ecn_fees + sec_fees + finra_fees + htb_fees + cat_fees + commission)
+                FROM trades {where}
+                GROUP BY date ORDER BY date
+            """, params)
+            rows = cur.fetchall()
+            print(f"\n{'='*80}\nDAILY SUMMARY\n{'='*80}")
+            print(f"{'Date':<12s} {'Trades':>6s} {'Gross':>10s} {'Fees':>10s} {'Net':>10s}")
+            for r in rows:
+                print(f"{str(r[0]):<12s} {r[1]:6d} {float(r[2]):+10.2f} {float(r[4]):+10.2f} {float(r[3]):+10.2f}")
+    finally:
+        conn.close()
 
-    # --- Summary ---
-    summary = conn.execute(f"""
-        SELECT date, COUNT(*), SUM(gross_pnl), SUM(net_pnl),
-               SUM(ecn_fees + sec_fees + finra_fees + htb_fees + cat_fees + commission)
-        FROM trades {where}
-        GROUP BY date ORDER BY date
-    """).fetchall()
-    print(f"\n{'='*80}")
-    print("DAILY SUMMARY")
-    print(f"{'='*80}")
-    print(f"{'Date':<12s} {'Trades':>6s} {'Gross':>10s} {'Fees':>10s} {'Net':>10s}")
-    print("-" * 50)
-    for r in summary:
-        print(f"{r[0]:<12s} {r[1]:6d} {r[2]:+10.2f} {r[4]:+10.2f} {r[3]:+10.2f}")
 
-    conn.close()
-
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
 
 def main():
     args = sys.argv[1:]
 
     if not args or "--help" in args:
-        print("Usage:")
-        print("  python ingest_trades.py 3-27-26          # process one day")
-        print("  python ingest_trades.py 3-27-26 3-28-26  # process multiple days")
-        print("  python ingest_trades.py --all             # process all CSV files")
-        print("  python ingest_trades.py --show            # print all DB contents")
-        print("  python ingest_trades.py --show 2026-03-27 # print one day")
+        print(__doc__)
         sys.exit(1)
 
     if "--show" in args:
         show_args = [a for a in args if a != "--show"]
         date_filter = show_args[0] if show_args else None
         show_db(date_filter)
+        sys.exit(0)
+
+    if "--locates" in args:
+        ingest_consolidated_locates()
         sys.exit(0)
 
     force = "--force" in args
@@ -828,27 +805,18 @@ def main():
         if not prefixes:
             print("No trade CSV files found.")
             sys.exit(1)
-        print(f"Found {len(prefixes)} trading days: {', '.join(prefixes)}")
+        print(f"Found {len(prefixes)} trading days")
     else:
         prefixes = args
 
-    conn = get_db()
-    print(f"Database: {SCRIPT_DIR / DB_NAME}")
+    conn = get_conn()
+    print(f"Connected to Postgres database '{TARGET_DB}'")
 
-    if force:
+    try:
         for prefix in prefixes:
-            trade_date = parse_date_from_filename(prefix + ".csv")
-            conn.execute("DELETE FROM trade_executions WHERE trade_id IN (SELECT id FROM trades WHERE date=?)", (trade_date,))
-            conn.execute("DELETE FROM trades WHERE date = ?", (trade_date,))
-            conn.execute("DELETE FROM raw_executions WHERE date = ?", (trade_date,))
-            conn.execute("DELETE FROM daily_fees WHERE date = ?", (trade_date,))
-        conn.commit()
-        print("Cleared existing data for selected dates (--force)")
-
-    for prefix in prefixes:
-        process_day(conn, prefix)
-
-    conn.close()
+            process_day(conn, prefix, force=force)
+    finally:
+        conn.close()
     print("\nDone.")
 
 
