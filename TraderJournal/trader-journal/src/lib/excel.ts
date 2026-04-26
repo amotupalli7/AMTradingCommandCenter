@@ -89,6 +89,7 @@ export function readTrades(): Trade[] {
       "Net R": Number(g("Net R")) || 0,
       Win: Number(g("Win")) || 0,
       "X Score": Number(g("Xscore") || g("X Score")) || 0,
+      "Acc %": Number(g("Acc %")) || 0,
       Setup: String(g("Setup") || ""),
       "Sub-Setup": String(g("Sub-Setup") || ""),
       Trigger: String(g("Trigger") || ""),

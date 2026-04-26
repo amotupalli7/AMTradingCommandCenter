@@ -9,6 +9,7 @@ export interface Trade {
   "Net R": number;
   Win: number;
   "X Score": number;
+  "Acc %": number;
   Setup: string;
   "Sub-Setup": string;
   Trigger: string;
