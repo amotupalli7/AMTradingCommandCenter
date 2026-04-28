@@ -27,6 +27,9 @@ Usage:
     python ingest_trades.py --show               # print all DB contents
     python ingest_trades.py --show 2026-03-27    # one day
     python ingest_trades.py --locates            # ingest consolidated locates.csv
+    python ingest_trades.py --data-dir <path> --all
+                                                 # use a different source folder
+                                                 # (e.g. SPTD 2025 historical backfill)
 """
 
 import csv
@@ -168,16 +171,29 @@ def load_fees(ar_path, trade_date):
     return rows
 
 
-def load_locates_file(path):
-    """Load a locates CSV (Date, Symbol, Shares, Cost). Returns list of dicts."""
+def load_locates_file(path, default_date=None):
+    """
+    Load a locates CSV. Two formats are supported:
+      - Newer (consolidated): columns Date, Symbol, Shares, Cost
+      - Older (per-day):       columns Symbol, Shares, Cost (date from filename)
+    `default_date` is required to parse the older per-day format.
+    """
     rows = []
     with open(path, "r", newline="") as f:
         reader = csv.DictReader(f)
         for row in reader:
             if not row.get("Symbol", "").strip():
                 continue
+            if "Date" in row and row["Date"]:
+                row_date = parse_us_date(row["Date"])
+            elif default_date is not None:
+                row_date = default_date
+            else:
+                raise ValueError(
+                    f"locates file {path} has no Date column and no default_date provided"
+                )
             rows.append({
-                "date": parse_us_date(row["Date"]),
+                "date": row_date,
                 "symbol": row["Symbol"].strip().upper(),
                 "shares": int(row["Shares"]),
                 "cost": float(row["Cost"]),
@@ -476,11 +492,46 @@ def insert_fees(cur, fee_rows):
               fr["htb_fee"], fr["cat_fee"]))
 
 
-def insert_trades(cur, trades, execution_ids):
+def assign_legacy_trade_id(cur, trade_id, preserve_legacy=None):
+    """
+    Stamp a legacy_trade_id on the given trades.id and ensure a trade_journal
+    row exists. Idempotent: if the trade already has a legacy_trade_id, does nothing.
+
+    `preserve_legacy`: if provided, reuse this ID (set by --force snapshot so
+    journal notes survive re-ingest). Otherwise allocate MAX+1.
+    """
+    cur.execute("SELECT legacy_trade_id FROM trades WHERE id = %s", (trade_id,))
+    row = cur.fetchone()
+    if row and row[0] is not None:
+        return row[0]
+
+    if preserve_legacy is not None:
+        legacy_id = preserve_legacy
+    else:
+        cur.execute("SELECT COALESCE(MAX(legacy_trade_id), 0) + 1 FROM trades")
+        legacy_id = cur.fetchone()[0]
+
+    cur.execute("UPDATE trades SET legacy_trade_id = %s WHERE id = %s",
+                (legacy_id, trade_id))
+    cur.execute("""
+        INSERT INTO trade_journal (legacy_trade_id) VALUES (%s)
+        ON CONFLICT (legacy_trade_id) DO NOTHING
+    """, (legacy_id,))
+    return legacy_id
+
+
+def insert_trades(cur, trades, execution_ids, legacy_snapshot=None):
     """
     Insert consolidated trades and link to raw executions. Carry trades are
     UPDATEd in place to keep their original id (and prior trade_executions links).
+    Each non-carry trade gets a fresh legacy_trade_id and an empty
+    trade_journal row so manual journaling can attach later.
+
+    `legacy_snapshot`: optional dict {(symbol, trade_index): legacy_trade_id}
+    captured before --force deleted today's trades, so re-inserted trades in
+    the same slot keep their old legacy ID (and attached journal notes).
     """
+    legacy_snapshot = legacy_snapshot or {}
     for t in trades:
         carry = t.get("carry")
         if carry:
@@ -537,6 +588,8 @@ def insert_trades(cur, trades, execution_ids):
                   t["ecn_fees"], t["sec_fees"], t["finra_fees"], t["htb_fees"],
                   t["cat_fees"], t["commission"], t["net_pnl"], t["trade_index"]))
             trade_id = cur.fetchone()[0]
+            preserved = legacy_snapshot.get((t["symbol"], t["trade_index"]))
+            assign_legacy_trade_id(cur, trade_id, preserve_legacy=preserved)
 
         for exec_idx in t["execution_indices"]:
             exec_id = execution_ids[exec_idx]
@@ -586,7 +639,22 @@ def process_day(conn, date_prefix, force=False):
     try:
         with conn:  # commits on success, rolls back on exception
             with conn.cursor() as cur:
+                legacy_snapshot = {}
                 if force:
+                    # Snapshot legacy_trade_ids by (symbol, trade_index) so journal
+                    # notes survive a re-ingest. The corresponding trade_journal
+                    # rows are intentionally NOT deleted - they get re-attached
+                    # to the new trades.id via the preserved legacy_trade_id.
+                    cur.execute("""
+                        SELECT symbol, trade_index, legacy_trade_id
+                        FROM trades
+                        WHERE date = %s AND legacy_trade_id IS NOT NULL
+                    """, (trade_date,))
+                    legacy_snapshot = {(s, idx): lid for s, idx, lid in cur.fetchall()}
+                    if legacy_snapshot:
+                        print(f"  Preserving {len(legacy_snapshot)} legacy_trade_id(s) "
+                              f"across re-ingest")
+
                     cur.execute("DELETE FROM trade_executions WHERE trade_id IN (SELECT id FROM trades WHERE date=%s)", (trade_date,))
                     cur.execute("DELETE FROM trades WHERE date=%s", (trade_date,))
                     cur.execute("DELETE FROM raw_executions WHERE date=%s", (trade_date,))
@@ -610,7 +678,7 @@ def process_day(conn, date_prefix, force=False):
 
                 locate_rows = []
                 if locates_path.exists():
-                    locate_rows = load_locates_file(str(locates_path))
+                    locate_rows = load_locates_file(str(locates_path), default_date=trade_date)
                     print(f"  Loaded {len(locate_rows)} locates")
 
                 trades = group_into_trades(executions, trade_date, cur=cur)
@@ -645,7 +713,7 @@ def process_day(conn, date_prefix, force=False):
 
                 execution_ids = insert_executions(cur, executions)
                 insert_fees(cur, fee_rows)
-                insert_trades(cur, trades, execution_ids)
+                insert_trades(cur, trades, execution_ids, legacy_snapshot=legacy_snapshot)
                 if locate_rows:
                     n = insert_locates(cur, locate_rows)
                     print(f"  Inserted {n} new locate rows")
@@ -781,11 +849,30 @@ def show_db(date_filter=None):
 # ---------------------------------------------------------------------------
 
 def main():
+    global DATA_DIR
     args = sys.argv[1:]
 
     if not args or "--help" in args:
         print(__doc__)
         sys.exit(1)
+
+    # --data-dir: override DATA_DIR for this run. Accepts a relative or absolute
+    # path; relative paths resolve against this script's directory.
+    if "--data-dir" in args:
+        i = args.index("--data-dir")
+        if i + 1 >= len(args):
+            print("ERROR: --data-dir requires a path argument", file=sys.stderr)
+            sys.exit(2)
+        raw = args[i + 1]
+        path = Path(raw)
+        if not path.is_absolute():
+            path = (SCRIPT_DIR / raw).resolve()
+        if not path.exists():
+            print(f"ERROR: --data-dir path not found: {path}", file=sys.stderr)
+            sys.exit(2)
+        DATA_DIR = path
+        print(f"Using data dir: {DATA_DIR}")
+        args = args[:i] + args[i + 2:]
 
     if "--show" in args:
         show_args = [a for a in args if a != "--show"]

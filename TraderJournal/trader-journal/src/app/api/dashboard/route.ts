@@ -10,8 +10,10 @@ import {
 
 export async function GET() {
   try {
-    const trades = readTrades();
-    const executions = readExecutions();
+    const [trades, executions] = await Promise.all([
+      readTrades(),
+      readExecutions(),
+    ]);
 
     const stats = calculateStats(executions, trades);
     const cumulativePnL = getCumulativePnL(trades);

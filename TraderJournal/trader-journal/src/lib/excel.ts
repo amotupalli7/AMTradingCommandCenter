@@ -1,228 +1,259 @@
-import * as XLSX from "xlsx";
-import fs from "fs";
-import path from "path";
+/**
+ * Postgres-backed data layer for the journal.
+ *
+ * Despite the filename, this no longer touches trades.xlsx — it queries the
+ * `trades_db` Postgres database (populated by TradeIngest's pipeline). The
+ * file kept its name and exported function shape so existing API routes
+ * (`@/lib/excel`) didn't have to change. Edits are written back to the
+ * `trade_journal` table.
+ */
 import { Trade, Execution, EDITABLE_FIELDS, EditableField } from "./types";
+import { query } from "./db";
 
-const EXCEL_PATH = path.resolve(process.cwd(), "..", "trades.xlsx");
-const BACKUP_DIR = path.resolve(process.cwd(), "..", "backups");
+// ---------------------------------------------------------------------------
+// Field-name mapping
+// ---------------------------------------------------------------------------
+// EDITABLE_FIELDS uses Excel-style names (e.g. "Entry Notes", "Sub-Setup").
+// The Postgres column is the snake_case form. This map keeps the API stable.
+const EDITABLE_FIELD_TO_COLUMN: Record<EditableField, string> = {
+  Trigger: "trigger",
+  Tags: "tags",
+  "Entry Notes": "entry_notes",
+  "Exit Notes": "exit_notes",
+  Notes: "notes",
+  "Mistake Notes": "mistake_notes",
+  Setup: "setup",
+  "Sub-Setup": "sub_setup",
+};
 
-// Read Excel file via buffer to avoid file locking issues on Windows
-// (when Excel has the file open, direct readFile fails)
-function readWorkbook(options?: XLSX.ParsingOptions): XLSX.WorkBook {
-  const buffer = fs.readFileSync(EXCEL_PATH);
-  return XLSX.read(buffer, { ...options });
+// ---------------------------------------------------------------------------
+// Type-safe row shapes coming back from v_trades_full
+// ---------------------------------------------------------------------------
+
+interface TradeRow {
+  legacy_trade_id: number;
+  date: Date;
+  symbol: string;
+  direction: string;
+  entry_time: string;
+  entry_avg_price: string;
+  net_pnl: string;
+  r_net: string | null;
+  win: number;
+  x_score: string | null;
+  acc_pct: string | null;
+  setup: string | null;
+  sub_setup: string | null;
+  trigger: string | null;
+  tags: string | null;
+  entry_notes: string | null;
+  exit_notes: string | null;
+  notes: string | null;
+  mistake_notes: string | null;
+  chart_url: string | null;
 }
 
-function ensureBackupDir() {
-  if (!fs.existsSync(BACKUP_DIR)) {
-    fs.mkdirSync(BACKUP_DIR, { recursive: true });
-  }
+interface ExecutionRow extends TradeRow {
+  exit_avg_price: string;
+  total_entry_shares: number;
+  total_exit_shares: number;
+  max_position: number;
+  num_executions: number;
+  gross_pnl: string;
+  hold_time_seconds: number | null;
+  ecn_fees: string | null;
+  sec_fees: string | null;
+  finra_fees: string | null;
+  htb_fees: string | null;
+  cat_fees: string | null;
+  commission: string | null;
+  trade_index: number;
+  dollar_risk: string | null;
+  risk_pct: string | null;
+  x_failing_goal: string | null;
+  x_non_playbook: string | null;
+  x_selection: string | null;
+  x_entry: string | null;
+  x_sizing: string | null;
+  x_exit: string | null;
+  x_emotional: string | null;
+  x_preparation: string | null;
 }
 
-function createBackup(): string {
-  ensureBackupDir();
-  const timestamp = new Date()
-    .toISOString()
-    .replace(/[:.]/g, "-")
-    .slice(0, 19);
-  const backupPath = path.join(BACKUP_DIR, `trades_${timestamp}.xlsx`);
-  fs.copyFileSync(EXCEL_PATH, backupPath);
-  return backupPath;
+// ---------------------------------------------------------------------------
+// Formatters (DB types -> the strings/numbers the UI expects)
+// ---------------------------------------------------------------------------
+
+function fmtDate(d: Date | string | null): string {
+  if (!d) return "";
+  if (typeof d === "string") return d;
+  // Local-date YYYY-MM-DD (avoid TZ shift from toISOString)
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, "0");
+  const day = String(d.getDate()).padStart(2, "0");
+  return `${y}-${m}-${day}`;
 }
 
-function formatExcelDate(serial: number | string | Date): string {
-  if (!serial && serial !== 0) return "";
-  if (typeof serial === "string") return serial;
-  if (serial instanceof Date) {
-    return serial.toISOString().split("T")[0];
-  }
-  // Excel serial date
-  const date = new Date((serial - 25569) * 86400 * 1000);
-  return date.toISOString().split("T")[0];
+function num(v: string | number | null | undefined): number {
+  if (v === null || v === undefined || v === "") return 0;
+  const n = typeof v === "string" ? parseFloat(v) : v;
+  return Number.isFinite(n) ? n : 0;
 }
 
-function formatExcelTime(value: number | string | Date | undefined): string {
-  if (!value && value !== 0) return "";
-  if (typeof value === "string") return value;
-  if (value instanceof Date) {
-    return value.toTimeString().slice(0, 8);
-  }
-  // Excel time as fraction of day
-  if (typeof value === "number" && value < 1) {
-    const totalSeconds = Math.round(value * 86400);
-    const hours = Math.floor(totalSeconds / 3600);
-    const minutes = Math.floor((totalSeconds % 3600) / 60);
-    const seconds = totalSeconds % 60;
-    return `${String(hours).padStart(2, "0")}:${String(minutes).padStart(2, "0")}:${String(seconds).padStart(2, "0")}`;
-  }
-  return String(value);
+function str(v: string | null | undefined): string {
+  return v ?? "";
 }
 
-// Helper to get a value from a row, trying trimmed key variations
-function getVal(row: Record<string, unknown>, key: string): unknown {
-  if (key in row) return row[key];
-  // Try with spaces
-  const trimmedKeys = Object.keys(row);
-  for (const k of trimmedKeys) {
-    if (k.trim() === key) return row[k];
-  }
-  return undefined;
+// ---------------------------------------------------------------------------
+// Trade ID + date sorting: surface dates in xlsx-compatible YYYY-MM-DD strings
+// ---------------------------------------------------------------------------
+
+function rowToTrade(r: TradeRow): Trade {
+  return {
+    "Trade ID": r.legacy_trade_id,
+    Date: fmtDate(r.date),
+    "Enter Time": r.entry_time,
+    Ticker: r.symbol,
+    Side: r.direction,
+    Price: num(r.entry_avg_price),
+    "Net P&L": num(r.net_pnl),
+    "Net R": num(r.r_net),
+    Win: num(r.win),
+    "X Score": num(r.x_score),
+    "Acc %": num(r.acc_pct),
+    Setup: str(r.setup),
+    "Sub-Setup": str(r.sub_setup),
+    Trigger: str(r.trigger),
+    Tags: str(r.tags),
+    "Entry Notes": str(r.entry_notes),
+    "Exit Notes": str(r.exit_notes),
+    Notes: str(r.notes),
+    "Mistake Notes": str(r.mistake_notes),
+    Chart: str(r.chart_url),
+    search: `${r.symbol}${str(r.setup)}${str(r.sub_setup)}`,
+  };
 }
 
-export function readTrades(): Trade[] {
-  const workbook = readWorkbook({ cellDates: true });
-  const sheet = workbook.Sheets["Trades"];
-  if (!sheet) throw new Error('Sheet "Trades" not found');
-
-  const raw = XLSX.utils.sheet_to_json<Record<string, unknown>>(sheet);
-
-  return raw.map((row) => {
-    const g = (key: string) => getVal(row, key);
-    return {
-      "Trade ID": Number(g("Trade ID")) || 0,
-      Date: formatExcelDate(g("Date") as number | string | Date),
-      "Enter Time": formatExcelTime(g("Enter Time") as number | string | Date | undefined),
-      Ticker: String(g("Ticker") || ""),
-      Side: String(g("Side") || ""),
-      Price: Number(g("Price")) || 0,
-      "Net P&L": Number(g("Net P&L")) || 0,
-      "Net R": Number(g("Net R")) || 0,
-      Win: Number(g("Win")) || 0,
-      "X Score": Number(g("Xscore") || g("X Score")) || 0,
-      "Acc %": Number(g("Acc %")) || 0,
-      Setup: String(g("Setup") || ""),
-      "Sub-Setup": String(g("Sub-Setup") || ""),
-      Trigger: String(g("Trigger") || ""),
-      Tags: String(g("Tags") || ""),
-      "Entry Notes": String(g("Entry Notes") || ""),
-      "Exit Notes": String(g("Exit Notes") || ""),
-      Notes: String(g("Notes") || ""),
-      "Mistake Notes": String(g("Mistake Notes") || ""),
-      Chart: String(g("Chart") || ""),
-      search: String(g("search") || ""),
-    };
-  });
+function rowToExecution(r: ExecutionRow): Execution {
+  return {
+    "Trade ID": r.legacy_trade_id,
+    Date: fmtDate(r.date),
+    "Enter Time": r.entry_time,
+    "Symbol / Ticker": r.symbol,
+    Side: r.direction,
+    Price: num(r.entry_avg_price),
+    Qty: r.total_entry_shares,
+    Route: "",
+    Type: r.direction === "Short" ? "Short" : "Margin",
+    "New Trade": 1,
+    "$ Value": num(r.entry_avg_price) * r.total_entry_shares,
+    "Gross P&L": num(r.gross_pnl),
+    Quantity: r.max_position,
+    "Exit Time": "",
+    ECN: num(r.ecn_fees),
+    Comms: num(r.commission),
+    SEC: num(r.sec_fees),
+    FINRA: num(r.finra_fees),
+    Locates: 0,
+    "CAT FEE": num(r.cat_fees),
+    "Net P&L": num(r.net_pnl),
+    "$ Risk": num(r.dollar_risk),
+    "R Net": num(r.r_net),
+    Win: num(r.win),
+    "Risk %": num(r.risk_pct),
+    "X: Failing Goal": num(r.x_failing_goal),
+    "X: Non-Playbook Trade": num(r.x_non_playbook),
+    "X: Selection Mistake": num(r.x_selection),
+    "X: Entry Mistake": num(r.x_entry),
+    "X: Sizing Mistake": num(r.x_sizing),
+    "X: Exit Mistake": num(r.x_exit),
+    "X: Emotional Mistake": num(r.x_emotional),
+    "X: Preparation Mistake": num(r.x_preparation),
+    "X Score": num(r.x_score),
+    Month: r.date instanceof Date ? r.date.getMonth() + 1 : 0,
+    "~Pos Size": num(r.entry_avg_price) * r.max_position,
+  };
 }
 
-export function readExecutions(): Execution[] {
-  const workbook = readWorkbook({ cellDates: true });
-  const sheet = workbook.Sheets["Executions"];
-  if (!sheet) throw new Error('Sheet "Executions" not found');
+// ---------------------------------------------------------------------------
+// Public API (preserves the existing call sites)
+// ---------------------------------------------------------------------------
 
-  const raw = XLSX.utils.sheet_to_json<Record<string, unknown>>(sheet);
+const TRADE_COLUMNS = `
+  legacy_trade_id, date, symbol, direction, entry_time, entry_avg_price,
+  net_pnl, r_net, win, x_score, acc_pct,
+  setup, sub_setup, trigger, tags,
+  entry_notes, exit_notes, notes, mistake_notes, chart_url
+`;
 
-  return raw.map((row) => {
-    const g = (key: string) => getVal(row, key);
-    return {
-    "Trade ID": Number(g("Trade ID")) || 0,
-    Date: formatExcelDate(g("Date") as number | string | Date),
-    "Enter Time": formatExcelTime(g("Enter Time") as number | string | Date | undefined),
-    "Symbol / Ticker": String(g("Symbol / Ticker") || g("Symbol") || g("Ticker") || ""),
-    Side: String(g("Side") || ""),
-    Price: Number(g("Price")) || 0,
-    Qty: Number(g("Qty")) || 0,
-    Route: String(g("Route") || ""),
-    Type: String(g("Type") || ""),
-    "New Trade": Number(g("New Trade")) || 0,
-    "$ Value": Number(g("$ Value")) || 0,
-    "Gross P&L": Number(g("Gross P&L")) || 0,
-    Quantity: Number(g("Quantity")) || 0,
-    "Exit Time": formatExcelTime(g("Exit Time") as number | string | Date | undefined),
-    ECN: Number(g("ECN")) || 0,
-    Comms: Number(g("Comms")) || 0,
-    SEC: Number(g("SEC")) || 0,
-    FINRA: Number(g("FINRA")) || 0,
-    Locates: Number(g("Locates")) || 0,
-    "CAT FEE": Number(g("CAT Fee") || g("CAT FEE")) || 0,
-    "Net P&L": Number(g("Net P&L")) || 0,
-    "$ Risk": Number(g("$ Risk")) || 0,
-    "R Net": Number(g("R Net")) || 0,
-    Win: Number(g("Win")) || 0,
-    "Risk %": Number(g("Risk %")) || 0,
-    "X: Failing Goal": Number(g("X: Failing Goal")) || 0,
-    "X: Non-Playbook Trade": Number(g("X: Non-Playbook Trade")) || 0,
-    "X: Selection Mistake": Number(g("X: Selection Mistake")) || 0,
-    "X: Entry Mistake": Number(g("X: Entry Mistake")) || 0,
-    "X: Sizing Mistake": Number(g("X: Sizing Mistake")) || 0,
-    "X: Exit Mistake": Number(g("X: Exit Mistake")) || 0,
-    "X: Emotional Mistake": Number(g("X: Emotional Mistake")) || 0,
-    "X: Preparation Mistake": Number(g("X: Preparation Mistake")) || 0,
-    "X Score": Number(g("Xscore") || g("X Score")) || 0,
-    Month: Number(g("Month")) || 0,
-    "~Pos Size": Number(g("~Pos Size")) || 0,
-    };
-  });
+const EXECUTION_COLUMNS = `
+  legacy_trade_id, date, symbol, direction, entry_time, entry_avg_price,
+  exit_avg_price, total_entry_shares, total_exit_shares, max_position,
+  num_executions, gross_pnl, hold_time_seconds,
+  ecn_fees, sec_fees, finra_fees, htb_fees, cat_fees, commission,
+  net_pnl, r_net, win, x_score, acc_pct, risk_pct, dollar_risk,
+  trade_index,
+  setup, sub_setup, trigger, tags,
+  entry_notes, exit_notes, notes, mistake_notes, chart_url,
+  x_failing_goal, x_non_playbook, x_selection, x_entry,
+  x_sizing, x_exit, x_emotional, x_preparation
+`;
+
+export async function readTrades(): Promise<Trade[]> {
+  const rows = await query<TradeRow>(
+    `SELECT ${TRADE_COLUMNS}
+     FROM v_trades_full
+     WHERE legacy_trade_id IS NOT NULL
+     ORDER BY date, entry_time`
+  );
+  return rows.map(rowToTrade);
 }
 
-export function getTradeById(tradeId: number): Trade | undefined {
-  const trades = readTrades();
-  return trades.find((t) => t["Trade ID"] === tradeId);
+export async function readExecutions(): Promise<Execution[]> {
+  const rows = await query<ExecutionRow>(
+    `SELECT ${EXECUTION_COLUMNS}
+     FROM v_trades_full
+     WHERE legacy_trade_id IS NOT NULL
+     ORDER BY date, entry_time`
+  );
+  return rows.map(rowToExecution);
 }
 
-export function updateTradeField(
+export async function getTradeById(tradeId: number): Promise<Trade | undefined> {
+  const rows = await query<TradeRow>(
+    `SELECT ${TRADE_COLUMNS}
+     FROM v_trades_full
+     WHERE legacy_trade_id = $1`,
+    [tradeId]
+  );
+  return rows[0] ? rowToTrade(rows[0]) : undefined;
+}
+
+export async function updateTradeField(
   tradeId: number,
   field: string,
   value: string
-): { success: boolean; error?: string } {
+): Promise<{ success: boolean; error?: string }> {
   if (!EDITABLE_FIELDS.includes(field as EditableField)) {
     return { success: false, error: `Field "${field}" is not editable` };
   }
 
+  const column = EDITABLE_FIELD_TO_COLUMN[field as EditableField];
+  if (!column) {
+    return { success: false, error: `No column mapping for field "${field}"` };
+  }
+
   try {
-    // Create backup before any modification
-    createBackup();
+    // Empty string becomes NULL so the view's COALESCE-style display stays clean
+    const dbValue = value === "" ? null : value;
 
-    // Read the raw workbook (preserving structure)
-    const workbook = readWorkbook();
-    const sheet = workbook.Sheets["Trades"];
-    if (!sheet) {
-      return { success: false, error: 'Sheet "Trades" not found' };
-    }
-
-    // Get range
-    const range = XLSX.utils.decode_range(sheet["!ref"] || "A1");
-
-    // Find the column index for the field
-    let fieldCol = -1;
-    for (let c = range.s.c; c <= range.e.c; c++) {
-      const cellAddr = XLSX.utils.encode_cell({ r: 0, c });
-      const cell = sheet[cellAddr];
-      if (cell && String(cell.v).trim() === field) {
-        fieldCol = c;
-        break;
-      }
-    }
-
-    if (fieldCol === -1) {
-      return { success: false, error: `Column "${field}" not found in sheet` };
-    }
-
-    // Find the row with matching Trade ID
-    let targetRow = -1;
-    for (let r = range.s.r + 1; r <= range.e.r; r++) {
-      const cellAddr = XLSX.utils.encode_cell({ r, c: 0 });
-      const cell = sheet[cellAddr];
-      if (cell && Number(cell.v) === tradeId) {
-        targetRow = r;
-        break;
-      }
-    }
-
-    if (targetRow === -1) {
-      return {
-        success: false,
-        error: `Trade ID ${tradeId} not found`,
-      };
-    }
-
-    // Update the cell
-    const targetAddr = XLSX.utils.encode_cell({ r: targetRow, c: fieldCol });
-    sheet[targetAddr] = { t: "s", v: value };
-
-    // Write back using buffer to handle file locking on Windows
-    const wbOut = XLSX.write(workbook, { type: "buffer", bookType: "xlsx" });
-    fs.writeFileSync(EXCEL_PATH, wbOut);
-
+    const result = await query(
+      `UPDATE trade_journal
+       SET ${column} = $1, updated_at = CURRENT_TIMESTAMP
+       WHERE legacy_trade_id = $2`,
+      [dbValue, tradeId]
+    );
+    void result;
     return { success: true };
   } catch (err) {
     return {

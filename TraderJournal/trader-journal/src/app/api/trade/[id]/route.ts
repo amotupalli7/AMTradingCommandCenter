@@ -10,7 +10,7 @@ export async function GET(
   const tradeId = parseInt(id, 10);
 
   try {
-    const trade = getTradeById(tradeId);
+    const trade = await getTradeById(tradeId);
     if (!trade) {
       return NextResponse.json(
         { error: `Trade ${tradeId} not found` },
@@ -51,7 +51,7 @@ export async function PATCH(
       );
     }
 
-    const result = updateTradeField(tradeId, field, value);
+    const result = await updateTradeField(tradeId, field, value);
     if (!result.success) {
       return NextResponse.json(
         { error: result.error },

@@ -17,7 +17,7 @@ import {
  */
 export async function GET() {
   try {
-    const trades = readTrades();
+    const trades = await readTrades();
     const urls: Record<number, string> = {};
 
     for (const trade of trades) {

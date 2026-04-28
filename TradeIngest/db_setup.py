@@ -146,6 +146,52 @@ SCHEMA_DDL = [
     )
     """,
 
+    # legacy_trade_id: stable Excel-era ID kept on trades for joining to
+    # trade_journal. Idempotent ALTER (Postgres 9.6+ supports IF NOT EXISTS).
+    "ALTER TABLE trades ADD COLUMN IF NOT EXISTS legacy_trade_id INTEGER",
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_trades_legacy_id ON trades(legacy_trade_id) WHERE legacy_trade_id IS NOT NULL",
+
+    # trade_journal: 1:1 with trades, keyed on legacy_trade_id. Holds all
+    # manual journaling fields previously in trades.xlsx (both tabs) plus
+    # per-trade $ Risk imported from Executions tab.
+    """
+    CREATE TABLE IF NOT EXISTS trade_journal (
+        legacy_trade_id   INTEGER PRIMARY KEY,
+        setup             TEXT,
+        sub_setup         TEXT,
+        trigger           TEXT,
+        tags              TEXT,
+        entry_notes       TEXT,
+        exit_notes        TEXT,
+        notes             TEXT,
+        mistake_notes     TEXT,
+        chart_url         TEXT,
+        win_override      INTEGER,                       -- NULL = use computed (net_pnl > 0)
+        dollar_risk       NUMERIC(12,4),                 -- per-trade, from xlsx Executions col 24
+        -- X-flags: 0, 0.5, or 1 (Excel sometimes assigns partial credit)
+        x_failing_goal    NUMERIC(3,2) DEFAULT 0,
+        x_non_playbook    NUMERIC(3,2) DEFAULT 0,
+        x_selection       NUMERIC(3,2) DEFAULT 0,
+        x_entry           NUMERIC(3,2) DEFAULT 0,
+        x_sizing          NUMERIC(3,2) DEFAULT 0,
+        x_exit            NUMERIC(3,2) DEFAULT 0,
+        x_emotional       NUMERIC(3,2) DEFAULT 0,
+        x_preparation     NUMERIC(3,2) DEFAULT 0,
+        updated_at        TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )
+    """,
+
+    # daily_account: one row per trading day. account_value and goal_R are
+    # informational; per-trade $ Risk lives on trade_journal and is the
+    # source of truth for risk calcs (not always reconcilable with account_value).
+    """
+    CREATE TABLE IF NOT EXISTS daily_account (
+        date          DATE PRIMARY KEY,
+        account_value NUMERIC(14,2),
+        goal_R        NUMERIC(8,4)
+    )
+    """,
+
     # Helpful indexes for common queries
     "CREATE INDEX IF NOT EXISTS idx_raw_exec_date_symbol ON raw_executions(date, symbol)",
     "CREATE INDEX IF NOT EXISTS idx_trades_date_symbol   ON trades(date, symbol)",
@@ -153,6 +199,102 @@ SCHEMA_DDL = [
     "CREATE INDEX IF NOT EXISTS idx_locates_date_symbol  ON locates(date, symbol)",
     "CREATE INDEX IF NOT EXISTS idx_daily_fees_date      ON daily_fees(date)",
 ]
+
+
+# v_trades_full: read-side view that joins trades + trade_journal +
+# daily_account and computes the columns that used to be Excel formulas
+# (~Pos Size, Acc %, Risk %, R Net, X Score, Day X Score, Day Net R).
+# Computed on read so we never have to keep them in sync.
+VIEW_DDL = """
+CREATE OR REPLACE VIEW v_trades_full AS
+WITH per_trade AS (
+    SELECT
+        t.id                                AS trade_id,
+        t.legacy_trade_id,
+        t.date,
+        t.symbol,
+        t.direction,
+        t.entry_time,
+        t.exit_time,
+        t.entry_avg_price,
+        t.exit_avg_price,
+        t.total_entry_shares,
+        t.total_exit_shares,
+        t.max_position,
+        t.num_executions,
+        t.gross_pnl,
+        t.hold_time_seconds,
+        t.ecn_fees,
+        t.sec_fees,
+        t.finra_fees,
+        t.htb_fees,
+        t.cat_fees,
+        t.commission,
+        t.net_pnl,
+        t.trade_index,
+        j.setup,
+        j.sub_setup,
+        j.trigger,
+        j.tags,
+        j.entry_notes,
+        j.exit_notes,
+        j.notes,
+        j.mistake_notes,
+        j.chart_url,
+        j.dollar_risk,
+        j.x_failing_goal,
+        j.x_non_playbook,
+        j.x_selection,
+        j.x_entry,
+        j.x_sizing,
+        j.x_exit,
+        j.x_emotional,
+        j.x_preparation,
+        COALESCE(j.win_override,
+                 CASE WHEN t.net_pnl > 0 THEN 1 ELSE 0 END)        AS win,
+        d.account_value,
+        d.goal_R,
+        -- ~Pos Size = entry_avg_price * max_position
+        ROUND(t.entry_avg_price * t.max_position, 2)                AS pos_size,
+        -- Risk % = $ Risk / account_value * 100
+        CASE WHEN d.account_value > 0 AND j.dollar_risk IS NOT NULL
+             THEN ROUND((j.dollar_risk / d.account_value) * 100, 4)
+        END                                                          AS risk_pct,
+        -- Acc % = net_pnl / account_value * 100
+        CASE WHEN d.account_value > 0
+             THEN ROUND((t.net_pnl / d.account_value) * 100, 4)
+        END                                                          AS acc_pct,
+        -- R Net = net_pnl / dollar_risk
+        CASE WHEN j.dollar_risk > 0
+             THEN ROUND(t.net_pnl / j.dollar_risk, 4)
+        END                                                          AS r_net,
+        -- X Score: weighted average. x_failing_goal acts as a gate - if set,
+        -- score is 0. Otherwise: (total_weights - sum(flag*weight)) / total_weights.
+        -- Weights: non_playbook 1.5, selection 1.5, entry 1, sizing 1, exit 1,
+        -- emotional 1.5, preparation 1.5.  Total weight = 9.
+        CASE WHEN COALESCE(j.x_failing_goal, 0) = 1 THEN 0
+             ELSE ROUND((
+                 9.0
+                 - COALESCE(j.x_non_playbook, 0) * 1.5
+                 - COALESCE(j.x_selection,    0) * 1.5
+                 - COALESCE(j.x_entry,        0) * 1.0
+                 - COALESCE(j.x_sizing,       0) * 1.0
+                 - COALESCE(j.x_exit,         0) * 1.0
+                 - COALESCE(j.x_emotional,    0) * 1.5
+                 - COALESCE(j.x_preparation,  0) * 1.5
+             )::numeric / 9.0, 4)
+        END                                                          AS x_score
+    FROM trades t
+    LEFT JOIN trade_journal j ON j.legacy_trade_id = t.legacy_trade_id
+    LEFT JOIN daily_account d ON d.date            = t.date
+)
+SELECT
+    p.*,
+    -- Day-level rollups: average X Score and sum of R Net across the day
+    AVG(p.x_score) OVER (PARTITION BY p.date)                       AS day_x_score,
+    SUM(p.r_net)   OVER (PARTITION BY p.date)                       AS day_net_r
+FROM per_trade p
+"""
 
 
 def create_schema(cfg, target_db):
@@ -165,6 +307,7 @@ def create_schema(cfg, target_db):
         with conn, conn.cursor() as cur:
             for ddl in SCHEMA_DDL:
                 cur.execute(ddl)
+            cur.execute(VIEW_DDL)
 
             cur.execute("""
                 SELECT table_name
@@ -177,6 +320,18 @@ def create_schema(cfg, target_db):
                 cur.execute("SELECT COUNT(*) FROM information_schema.columns WHERE table_name = %s", (t,))
                 n = cur.fetchone()[0]
                 print(f"    {t:<20} ({n} columns)")
+
+            cur.execute("""
+                SELECT table_name
+                FROM information_schema.views
+                WHERE table_schema = 'public'
+                ORDER BY table_name
+            """)
+            views = cur.fetchall()
+            if views:
+                print(f"\n  Views in {target_db!r}:")
+                for (v,) in views:
+                    print(f"    {v}")
     finally:
         conn.close()
 

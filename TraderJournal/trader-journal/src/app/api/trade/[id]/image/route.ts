@@ -46,7 +46,7 @@ export async function GET(
       );
     }
 
-    const trade = getTradeById(tradeId);
+    const trade = await getTradeById(tradeId);
     if (!trade) {
       return NextResponse.json({ error: "Trade not found" }, { status: 404 });
     }

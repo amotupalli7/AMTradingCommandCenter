@@ -3,7 +3,7 @@ import { readTrades } from "@/lib/excel";
 
 export async function GET() {
   try {
-    const trades = readTrades();
+    const trades = await readTrades();
     // Sort: date desc → group by ticker (ordered by ticker's first trade on that date) → entry time asc within ticker
     // Build a map of date+ticker → earliest entry time so all of a ticker's trades stay together
     const firstEntry: Record<string, string> = {};
