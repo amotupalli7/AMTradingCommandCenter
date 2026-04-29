@@ -7,9 +7,12 @@ export interface Trade {
   Price: number;
   "Net P&L": number;
   "Net R": number;
-  Win: number;
+  Win: number;                      // 0 or 1 (computed from net_pnl unless overridden)
+  "Win Override": number | null;    // null = use computed; 0/1 to override
   "X Score": number;
   "Acc %": number;
+  "Risk %": number;
+  "$ Risk": number;
   Setup: string;
   "Sub-Setup": string;
   Trigger: string;
@@ -19,6 +22,15 @@ export interface Trade {
   Notes: string;
   "Mistake Notes": string;
   Chart: string;
+  // 8 X-mistake flags: 0, 0.5, or 1
+  "X: Failing Goal": number;
+  "X: Non-Playbook Trade": number;
+  "X: Selection Mistake": number;
+  "X: Entry Mistake": number;
+  "X: Sizing Mistake": number;
+  "X: Exit Mistake": number;
+  "X: Emotional Mistake": number;
+  "X: Preparation Mistake": number;
   search: string;
 }
 
@@ -115,6 +127,32 @@ export const EDITABLE_FIELDS = [
   "Mistake Notes",
   "Setup",
   "Sub-Setup",
+  "$ Risk",
+  "Win Override",
+  "X: Failing Goal",
+  "X: Non-Playbook Trade",
+  "X: Selection Mistake",
+  "X: Entry Mistake",
+  "X: Sizing Mistake",
+  "X: Exit Mistake",
+  "X: Emotional Mistake",
+  "X: Preparation Mistake",
 ] as const;
 
 export type EditableField = (typeof EDITABLE_FIELDS)[number];
+
+// Fields that store numeric values (not strings). updateTradeField treats them
+// differently: empty string -> NULL, otherwise parsed as float. The view's
+// X Score formula treats X: Failing Goal == 1 specially as a gate.
+export const NUMERIC_EDITABLE_FIELDS: ReadonlySet<EditableField> = new Set([
+  "$ Risk",
+  "Win Override",
+  "X: Failing Goal",
+  "X: Non-Playbook Trade",
+  "X: Selection Mistake",
+  "X: Entry Mistake",
+  "X: Sizing Mistake",
+  "X: Exit Mistake",
+  "X: Emotional Mistake",
+  "X: Preparation Mistake",
+]);

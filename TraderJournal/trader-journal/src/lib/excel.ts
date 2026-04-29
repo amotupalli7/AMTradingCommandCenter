@@ -7,7 +7,13 @@
  * (`@/lib/excel`) didn't have to change. Edits are written back to the
  * `trade_journal` table.
  */
-import { Trade, Execution, EDITABLE_FIELDS, EditableField } from "./types";
+import {
+  Trade,
+  Execution,
+  EDITABLE_FIELDS,
+  EditableField,
+  NUMERIC_EDITABLE_FIELDS,
+} from "./types";
 import { query } from "./db";
 
 // ---------------------------------------------------------------------------
@@ -24,6 +30,16 @@ const EDITABLE_FIELD_TO_COLUMN: Record<EditableField, string> = {
   "Mistake Notes": "mistake_notes",
   Setup: "setup",
   "Sub-Setup": "sub_setup",
+  "$ Risk": "dollar_risk",
+  "Win Override": "win_override",
+  "X: Failing Goal": "x_failing_goal",
+  "X: Non-Playbook Trade": "x_non_playbook",
+  "X: Selection Mistake": "x_selection",
+  "X: Entry Mistake": "x_entry",
+  "X: Sizing Mistake": "x_sizing",
+  "X: Exit Mistake": "x_exit",
+  "X: Emotional Mistake": "x_emotional",
+  "X: Preparation Mistake": "x_preparation",
 };
 
 // ---------------------------------------------------------------------------
@@ -40,6 +56,9 @@ interface TradeRow {
   net_pnl: string;
   r_net: string | null;
   win: number;
+  win_override: number | null;
+  dollar_risk: string | null;
+  risk_pct: string | null;
   x_score: string | null;
   acc_pct: string | null;
   setup: string | null;
@@ -51,6 +70,14 @@ interface TradeRow {
   notes: string | null;
   mistake_notes: string | null;
   chart_url: string | null;
+  x_failing_goal: string | null;
+  x_non_playbook: string | null;
+  x_selection: string | null;
+  x_entry: string | null;
+  x_sizing: string | null;
+  x_exit: string | null;
+  x_emotional: string | null;
+  x_preparation: string | null;
 }
 
 interface ExecutionRow extends TradeRow {
@@ -119,8 +146,11 @@ function rowToTrade(r: TradeRow): Trade {
     "Net P&L": num(r.net_pnl),
     "Net R": num(r.r_net),
     Win: num(r.win),
+    "Win Override": r.win_override === null ? null : Number(r.win_override),
     "X Score": num(r.x_score),
     "Acc %": num(r.acc_pct),
+    "Risk %": num(r.risk_pct),
+    "$ Risk": num(r.dollar_risk),
     Setup: str(r.setup),
     "Sub-Setup": str(r.sub_setup),
     Trigger: str(r.trigger),
@@ -130,6 +160,14 @@ function rowToTrade(r: TradeRow): Trade {
     Notes: str(r.notes),
     "Mistake Notes": str(r.mistake_notes),
     Chart: str(r.chart_url),
+    "X: Failing Goal": num(r.x_failing_goal),
+    "X: Non-Playbook Trade": num(r.x_non_playbook),
+    "X: Selection Mistake": num(r.x_selection),
+    "X: Entry Mistake": num(r.x_entry),
+    "X: Sizing Mistake": num(r.x_sizing),
+    "X: Exit Mistake": num(r.x_exit),
+    "X: Emotional Mistake": num(r.x_emotional),
+    "X: Preparation Mistake": num(r.x_preparation),
     search: `${r.symbol}${str(r.setup)}${str(r.sub_setup)}`,
   };
 }
@@ -181,9 +219,11 @@ function rowToExecution(r: ExecutionRow): Execution {
 
 const TRADE_COLUMNS = `
   legacy_trade_id, date, symbol, direction, entry_time, entry_avg_price,
-  net_pnl, r_net, win, x_score, acc_pct,
+  net_pnl, r_net, win, win_override, x_score, acc_pct, risk_pct, dollar_risk,
   setup, sub_setup, trigger, tags,
-  entry_notes, exit_notes, notes, mistake_notes, chart_url
+  entry_notes, exit_notes, notes, mistake_notes, chart_url,
+  x_failing_goal, x_non_playbook, x_selection, x_entry,
+  x_sizing, x_exit, x_emotional, x_preparation
 `;
 
 const EXECUTION_COLUMNS = `
@@ -243,17 +283,113 @@ export async function updateTradeField(
     return { success: false, error: `No column mapping for field "${field}"` };
   }
 
-  try {
-    // Empty string becomes NULL so the view's COALESCE-style display stays clean
-    const dbValue = value === "" ? null : value;
+  // Numeric vs text handling. The API accepts a string value for both kinds;
+  // numeric fields parse it, validate the range, and bind a number.
+  let dbValue: string | number | null;
+  if (NUMERIC_EDITABLE_FIELDS.has(field as EditableField)) {
+    if (value === "" || value === null || value === undefined) {
+      dbValue = null;
+    } else {
+      const parsed = parseFloat(value);
+      if (!Number.isFinite(parsed)) {
+        return { success: false, error: `"${value}" is not a valid number for ${field}` };
+      }
+      if (field === "Win Override") {
+        if (parsed !== 0 && parsed !== 1) {
+          return { success: false, error: "Win Override must be 0, 1, or empty" };
+        }
+      } else if (field.startsWith("X: ")) {
+        if (parsed !== 0 && parsed !== 0.5 && parsed !== 1) {
+          return { success: false, error: `${field} must be 0, 0.5, or 1` };
+        }
+      } else if (field === "$ Risk") {
+        if (parsed < 0) {
+          return { success: false, error: "$ Risk cannot be negative" };
+        }
+      }
+      dbValue = parsed;
+    }
+  } else {
+    dbValue = value === "" ? null : value;
+  }
 
-    const result = await query(
+  try {
+    await query(
       `UPDATE trade_journal
        SET ${column} = $1, updated_at = CURRENT_TIMESTAMP
        WHERE legacy_trade_id = $2`,
       [dbValue, tradeId]
     );
-    void result;
+    return { success: true };
+  } catch (err) {
+    return {
+      success: false,
+      error: err instanceof Error ? err.message : "Unknown error",
+    };
+  }
+}
+
+// ---------------------------------------------------------------------------
+// daily_account: per-trading-day account_value and goal_R
+// ---------------------------------------------------------------------------
+
+export interface DailyAccountRow {
+  date: string;            // YYYY-MM-DD
+  account_value: number | null;
+  goal_R: number | null;
+}
+
+interface DailyAccountDbRow {
+  date: Date;
+  account_value: string | null;
+  goal_r: string | null;
+}
+
+export async function readDailyAccount(): Promise<DailyAccountRow[]> {
+  const rows = await query<DailyAccountDbRow>(
+    `SELECT date, account_value, goal_R FROM daily_account ORDER BY date DESC`
+  );
+  return rows.map((r) => ({
+    date: fmtDate(r.date),
+    account_value: r.account_value === null ? null : Number(r.account_value),
+    goal_R: r.goal_r === null ? null : Number(r.goal_r),
+  }));
+}
+
+export async function upsertDailyAccount(
+  date: string,
+  accountValue: number | null,
+  goalR: number | null
+): Promise<{ success: boolean; error?: string }> {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) {
+    return { success: false, error: `Invalid date "${date}", expected YYYY-MM-DD` };
+  }
+  try {
+    await query(
+      `INSERT INTO daily_account (date, account_value, goal_R)
+       VALUES ($1, $2, $3)
+       ON CONFLICT (date) DO UPDATE SET
+         account_value = EXCLUDED.account_value,
+         goal_R        = EXCLUDED.goal_R`,
+      [date, accountValue, goalR]
+    );
+    return { success: true };
+  } catch (err) {
+    return {
+      success: false,
+      error: err instanceof Error ? err.message : "Unknown error",
+    };
+  }
+}
+
+export async function deleteDailyAccount(
+  date: string
+): Promise<{ success: boolean; error?: string }> {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) {
+    return { success: false, error: `Invalid date "${date}", expected YYYY-MM-DD` };
+  }
+  try {
+    await query(`DELETE FROM daily_account WHERE date = $1`, [date]);
     return { success: true };
   } catch (err) {
     return {

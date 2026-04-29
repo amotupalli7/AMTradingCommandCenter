@@ -250,6 +250,7 @@ WITH per_trade AS (
         j.x_exit,
         j.x_emotional,
         j.x_preparation,
+        j.win_override,
         COALESCE(j.win_override,
                  CASE WHEN t.net_pnl > 0 THEN 1 ELSE 0 END)        AS win,
         d.account_value,
@@ -307,6 +308,9 @@ def create_schema(cfg, target_db):
         with conn, conn.cursor() as cur:
             for ddl in SCHEMA_DDL:
                 cur.execute(ddl)
+            # CREATE OR REPLACE VIEW can't reorder/rename columns. Drop first
+            # so column-list changes apply on every run. Idempotent.
+            cur.execute("DROP VIEW IF EXISTS v_trades_full")
             cur.execute(VIEW_DDL)
 
             cur.execute("""

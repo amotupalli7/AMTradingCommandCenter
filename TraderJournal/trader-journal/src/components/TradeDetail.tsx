@@ -2,6 +2,12 @@
 
 import { Trade } from "@/lib/types";
 import { EditableField } from "./EditableField";
+import {
+  SetupEditor,
+  DollarRiskEditor,
+  WinOverrideEditor,
+  XFlagToggle,
+} from "./JournalEditors";
 import { Badge } from "@/components/ui/badge";
 import { Input } from "@/components/ui/input";
 import { Skeleton } from "@/components/ui/skeleton";
@@ -13,11 +19,21 @@ interface TradeDetailProps {
   trade: Trade;
   allTags?: string[];
   allTriggers?: string[];
+  allSetups?: string[];
+  allSubSetups?: string[];
   chartUrl?: string;
   onSaved?: () => void;
 }
 
-export function TradeDetail({ trade, allTags = [], allTriggers = [], chartUrl, onSaved }: TradeDetailProps) {
+export function TradeDetail({
+  trade,
+  allTags = [],
+  allTriggers = [],
+  allSetups = [],
+  allSubSetups = [],
+  chartUrl,
+  onSaved,
+}: TradeDetailProps) {
   const [imageLoaded, setImageLoaded] = useState(false);
   const [imageError, setImageError] = useState(false);
   const [lightboxOpen, setLightboxOpen] = useState(false);
@@ -163,6 +179,102 @@ export function TradeDetail({ trade, allTags = [], allTriggers = [], chartUrl, o
           allTags={allTags}
           onSaved={onSaved}
         />
+
+        {/* Setup / Sub-Setup / $ Risk / Win Override row */}
+        <div className="flex flex-wrap gap-6 items-end pt-2 border-t border-slate-800">
+          <SetupEditor
+            value={trade.Setup}
+            field="Setup"
+            options={allSetups}
+            tradeId={trade["Trade ID"]}
+            onSaved={onSaved}
+            label="Setup"
+          />
+          <SetupEditor
+            value={trade["Sub-Setup"]}
+            field="Sub-Setup"
+            options={allSubSetups}
+            tradeId={trade["Trade ID"]}
+            onSaved={onSaved}
+            label="Sub-Setup"
+          />
+          <DollarRiskEditor
+            value={trade["$ Risk"]}
+            tradeId={trade["Trade ID"]}
+            onSaved={onSaved}
+          />
+          <WinOverrideEditor
+            winOverride={trade["Win Override"]}
+            computedWin={trade.Win}
+            tradeId={trade["Trade ID"]}
+            onSaved={onSaved}
+          />
+        </div>
+
+        {/* X-mistake flags */}
+        <div className="space-y-2 pt-2 border-t border-slate-800">
+          <div className="text-xs font-medium text-muted-foreground uppercase tracking-wider">
+            X-Mistake Flags <span className="text-slate-600 normal-case font-normal">(click value or label to set)</span>
+          </div>
+          <div className="grid grid-cols-2 md:grid-cols-4 gap-2">
+            <XFlagToggle
+              label="Failing Goal"
+              value={trade["X: Failing Goal"]}
+              field="X: Failing Goal"
+              tradeId={trade["Trade ID"]}
+              onSaved={onSaved}
+            />
+            <XFlagToggle
+              label="Non-Playbook"
+              value={trade["X: Non-Playbook Trade"]}
+              field="X: Non-Playbook Trade"
+              tradeId={trade["Trade ID"]}
+              onSaved={onSaved}
+            />
+            <XFlagToggle
+              label="Selection"
+              value={trade["X: Selection Mistake"]}
+              field="X: Selection Mistake"
+              tradeId={trade["Trade ID"]}
+              onSaved={onSaved}
+            />
+            <XFlagToggle
+              label="Entry"
+              value={trade["X: Entry Mistake"]}
+              field="X: Entry Mistake"
+              tradeId={trade["Trade ID"]}
+              onSaved={onSaved}
+            />
+            <XFlagToggle
+              label="Sizing"
+              value={trade["X: Sizing Mistake"]}
+              field="X: Sizing Mistake"
+              tradeId={trade["Trade ID"]}
+              onSaved={onSaved}
+            />
+            <XFlagToggle
+              label="Exit"
+              value={trade["X: Exit Mistake"]}
+              field="X: Exit Mistake"
+              tradeId={trade["Trade ID"]}
+              onSaved={onSaved}
+            />
+            <XFlagToggle
+              label="Emotional"
+              value={trade["X: Emotional Mistake"]}
+              field="X: Emotional Mistake"
+              tradeId={trade["Trade ID"]}
+              onSaved={onSaved}
+            />
+            <XFlagToggle
+              label="Preparation"
+              value={trade["X: Preparation Mistake"]}
+              field="X: Preparation Mistake"
+              tradeId={trade["Trade ID"]}
+              onSaved={onSaved}
+            />
+          </div>
+        </div>
 
         {/* Editable Fields */}
         <div className="grid grid-cols-1 md:grid-cols-2 gap-4">

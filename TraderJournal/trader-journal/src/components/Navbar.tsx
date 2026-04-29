@@ -29,6 +29,9 @@ export function Navbar() {
             <NavTab href="/dashboard" active={pathname === "/dashboard"}>
               Dashboard
             </NavTab>
+            <NavTab href="/daily" active={pathname === "/daily"}>
+              Daily
+            </NavTab>
           </div>
         </div>
       </div>

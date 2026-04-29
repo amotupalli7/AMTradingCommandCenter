@@ -1,24 +1,21 @@
 """
-One-time importer: merge two trades.xlsx sources into Postgres.
+One-time importer: seed legacy_trade_id and trade_journal from
+TraderJournal/trades.xlsx (the canonical journal file).
 
-Two xlsx files exist:
-  - TraderJournal/trades.xlsx  -- older mtime, fuller historical span
-                                  (TIDs 1038..3477), includes hand-edited
-                                  notes/tags/setups via the journal app.
-                                  ** Source of truth for text fields. **
-  - TradeIngest/trades.xlsx    -- newer mtime, narrower span (TIDs 2875..3482).
-                                  Contains the 5 newest trades (3478..3482)
-                                  not yet in TJ. X-flags and $ Risk match.
+That file is a superset: TIDs 1038..3477 covering 2024-12 through 2026.
+The only trades it doesn't have (3478..3482, the 5 newest scratches)
+have no notes anyway -- they stay as empty journal rows in Postgres.
 
 This importer:
-  1. Loads both files; merges by Trade ID, TJ wins on text conflict.
-     X-flags / $ Risk taken from whichever has them (they're identical
-     in overlap, TI-only for 3478..3482).
-  2. Matches each merged xlsx row to a Postgres `trades` row on
-     (date, symbol, entry_time). Postgres trades.legacy_trade_id is
-     currently a placeholder from ingest -- this importer rewrites it
-     to the xlsx Trade ID so historical IDs match what the user knows.
-  3. Upserts `trade_journal` keyed by the (rewritten) legacy_trade_id.
+  1. Reads TraderJournal/trades.xlsx (Executions + Trades tabs).
+  2. Matches each xlsx row to a Postgres `trades` row on
+     (date, symbol, entry_time).
+  3. Re-stamps `trades.legacy_trade_id` to the xlsx Trade ID so
+     historical IDs match what the user knows. Trades that ingested
+     into Postgres but aren't in xlsx (e.g. swing-trade entries from
+     2024-12 anchored before xlsx coverage) keep their auto-assigned
+     placeholder IDs.
+  4. Upserts `trade_journal` keyed by the (rewritten) legacy_trade_id.
 
 Default mode is DRY-RUN. Pass --commit to write.
 
@@ -40,8 +37,7 @@ from dotenv import load_dotenv
 
 SCRIPT_DIR = Path(__file__).parent
 ENV_PATH = SCRIPT_DIR / ".env"
-TJ_XLSX_PATH = SCRIPT_DIR.parent / "TraderJournal" / "trades.xlsx"
-TI_XLSX_PATH = SCRIPT_DIR / "trades.xlsx"
+XLSX_PATH = SCRIPT_DIR.parent / "TraderJournal" / "trades.xlsx"
 TARGET_DB = "trades_db"
 
 
@@ -64,11 +60,19 @@ def get_conn():
 # xlsx readers
 # ---------------------------------------------------------------------------
 
+# Excel epoch: 1899-12-30. Day 1 = 1900-01-01. (Lotus 1-2-3 leap-year bug means
+# this avoids the pre-March-1900 corner case.)
+_EXCEL_EPOCH = date(1899, 12, 30)
+
+
 def to_date(v):
     if isinstance(v, datetime):
         return v.date()
     if isinstance(v, date):
         return v
+    if isinstance(v, (int, float)):
+        from datetime import timedelta
+        return _EXCEL_EPOCH + timedelta(days=int(v))
     return None
 
 
@@ -218,82 +222,44 @@ def match_xlsx_to_db(execs_xlsx, by_key, by_date_symbol):
 
 
 # ---------------------------------------------------------------------------
-# Source merging
+# Combine Executions + Trades tabs into one record per Trade ID
 # ---------------------------------------------------------------------------
 
-def _take_text(tj_val, ti_val):
-    """TJ wins for text fields if it has a non-empty value, else fall back to TI."""
-    if tj_val is not None and tj_val != "":
-        return tj_val
-    return ti_val
-
-
-def _take_flag(tj_val, ti_val):
-    """X-flags: identical in overlap, but TJ has historicals only.
-    Use whichever is present; if both, they should be equal."""
-    if tj_val is not None:
-        return tj_val
-    return ti_val if ti_val is not None else 0
-
-
-def merge_sources(execs_tj, trades_tj, execs_ti, trades_ti):
+def combine_tabs(execs_xlsx, trades_xlsx):
     """
-    Merge the two xlsx sources into one canonical dict per Trade ID.
-    Returns: dict[tid -> {date, symbol, entry_time, dollar_risk, x_*, setup,
-                          sub_setup, trigger, tags, entry_notes, exit_notes,
-                          notes, mistake_notes, chart}]
+    Flatten the two-tab structure into one dict per TID with all the fields
+    the writer needs. Trades tab may be missing for the most-recent un-journaled
+    trades; those still get a record with text fields = None.
     """
-    all_tids = set(execs_tj) | set(execs_ti)
-    merged = {}
-    text_conflicts = 0
-    text_diff_samples = []
-
-    for tid in sorted(all_tids):
-        tj_e = execs_tj.get(tid)
-        ti_e = execs_ti.get(tid)
-        tj_t = trades_tj.get(tid)
-        ti_t = trades_ti.get(tid)
-
-        # Date / symbol / entry_time should be consistent across files for the
-        # same TID; pick TJ if present, else TI.
-        primary_e = tj_e or ti_e
-        if primary_e is None:
-            continue  # shouldn't happen since tid came from execs union
-
-        # Text fields: TJ wins. Track conflicts so we know the merge is doing work.
-        text_keys = ["setup", "sub_setup", "trigger", "tags",
-                     "entry_notes", "exit_notes", "notes", "mistake_notes", "chart"]
-        text = {}
-        for k in text_keys:
-            tj_v = (tj_t or {}).get(k)
-            ti_v = (ti_t or {}).get(k)
-            text[k] = _take_text(tj_v, ti_v)
-            if (tj_v not in (None, "")) and (ti_v not in (None, "")) and tj_v != ti_v:
-                text_conflicts += 1
-                if len(text_diff_samples) < 5:
-                    text_diff_samples.append((tid, k, ti_v, tj_v))
-
-        merged[tid] = {
-            "trade_id":      tid,
-            "date":          primary_e["date"],
-            "symbol":        primary_e["symbol"],
-            "entry_time":    primary_e["entry_time"],
-            "side":          primary_e.get("side"),
-            "dollar_risk":   primary_e["dollar_risk"],
-            "x_failing_goal": _take_flag(tj_e and tj_e["x_failing_goal"], ti_e and ti_e["x_failing_goal"]),
-            "x_non_playbook": _take_flag(tj_e and tj_e["x_non_playbook"], ti_e and ti_e["x_non_playbook"]),
-            "x_selection":    _take_flag(tj_e and tj_e["x_selection"],    ti_e and ti_e["x_selection"]),
-            "x_entry":        _take_flag(tj_e and tj_e["x_entry"],        ti_e and ti_e["x_entry"]),
-            "x_sizing":       _take_flag(tj_e and tj_e["x_sizing"],       ti_e and ti_e["x_sizing"]),
-            "x_exit":         _take_flag(tj_e and tj_e["x_exit"],         ti_e and ti_e["x_exit"]),
-            "x_emotional":    _take_flag(tj_e and tj_e["x_emotional"],    ti_e and ti_e["x_emotional"]),
-            "x_preparation":  _take_flag(tj_e and tj_e["x_preparation"],  ti_e and ti_e["x_preparation"]),
-            **text,
-            "_source_tj_only": (tid in execs_tj) and (tid not in execs_ti),
-            "_source_ti_only": (tid in execs_ti) and (tid not in execs_tj),
+    out = {}
+    for tid, e in execs_xlsx.items():
+        t = trades_xlsx.get(tid, {})
+        out[tid] = {
+            "trade_id":       tid,
+            "date":           e["date"],
+            "symbol":         e["symbol"],
+            "entry_time":     e["entry_time"],
+            "side":           e.get("side"),
+            "dollar_risk":    e["dollar_risk"],
+            "x_failing_goal": e["x_failing_goal"],
+            "x_non_playbook": e["x_non_playbook"],
+            "x_selection":    e["x_selection"],
+            "x_entry":        e["x_entry"],
+            "x_sizing":       e["x_sizing"],
+            "x_exit":         e["x_exit"],
+            "x_emotional":    e["x_emotional"],
+            "x_preparation":  e["x_preparation"],
+            "setup":          t.get("setup"),
+            "sub_setup":      t.get("sub_setup"),
+            "trigger":        t.get("trigger"),
+            "tags":           t.get("tags"),
+            "entry_notes":    t.get("entry_notes"),
+            "exit_notes":     t.get("exit_notes"),
+            "notes":          t.get("notes"),
+            "mistake_notes":  t.get("mistake_notes"),
+            "chart":          t.get("chart"),
         }
-
-    return merged, text_conflicts, text_diff_samples
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -397,39 +363,24 @@ def main():
     commit = "--commit" in args
     verbose = "--verbose" in args
 
-    for p in (TJ_XLSX_PATH, TI_XLSX_PATH):
-        if not p.exists():
-            print(f"ERROR: {p} not found", file=sys.stderr)
-            sys.exit(1)
+    if not XLSX_PATH.exists():
+        print(f"ERROR: {XLSX_PATH} not found", file=sys.stderr)
+        sys.exit(1)
 
-    print(f"Reading TraderJournal source: {TJ_XLSX_PATH}")
-    wb_tj = openpyxl.load_workbook(TJ_XLSX_PATH, data_only=True)
-    execs_tj = read_executions(wb_tj["Executions"])
-    trades_tj = read_trades(wb_tj["Trades"])
-    print(f"  Executions: {len(execs_tj)} trades")
-    print(f"  Trades:     {len(trades_tj)} trades")
+    print(f"Reading {XLSX_PATH}")
+    wb = openpyxl.load_workbook(XLSX_PATH, data_only=True)
+    execs_xlsx = read_executions(wb["Executions"])
+    trades_xlsx = read_trades(wb["Trades"])
+    print(f"  Executions: {len(execs_xlsx)} trades")
+    print(f"  Trades:     {len(trades_xlsx)} trades")
 
-    print(f"\nReading TradeIngest source:   {TI_XLSX_PATH}")
-    wb_ti = openpyxl.load_workbook(TI_XLSX_PATH, data_only=True)
-    execs_ti = read_executions(wb_ti["Executions"])
-    trades_ti = read_trades(wb_ti["Trades"])
-    print(f"  Executions: {len(execs_ti)} trades")
-    print(f"  Trades:     {len(trades_ti)} trades")
+    only_in_exec = set(execs_xlsx) - set(trades_xlsx)
+    if only_in_exec:
+        print(f"  {len(only_in_exec)} trades in Executions but not Trades (no notes yet): "
+              f"{sorted(only_in_exec)[:5]}{'...' if len(only_in_exec) > 5 else ''}")
 
-    print(f"\nMerging sources (TJ wins on text conflict)...")
-    merged, conflicts, samples = merge_sources(execs_tj, trades_tj, execs_ti, trades_ti)
-    tj_only = sum(1 for m in merged.values() if m["_source_tj_only"])
-    ti_only = sum(1 for m in merged.values() if m["_source_ti_only"])
-    both    = len(merged) - tj_only - ti_only
-    print(f"  Merged: {len(merged)} trades")
-    print(f"    TJ only: {tj_only}, TI only: {ti_only}, both: {both}")
-    print(f"  Text-field conflicts (TJ overrode TI): {conflicts}")
-    if samples:
-        print(f"  Sample conflicts (TI value -> TJ value):")
-        for tid, k, ti_v, tj_v in samples:
-            ti_s = (ti_v or "")[:40] if isinstance(ti_v, str) else ti_v
-            tj_s = (tj_v or "")[:40] if isinstance(tj_v, str) else tj_v
-            print(f"    TID {tid} {k}: {ti_s!r} -> {tj_s!r}")
+    merged = combine_tabs(execs_xlsx, trades_xlsx)
+    print(f"  Combined records: {len(merged)} trades")
 
     conn = get_conn()
     try:

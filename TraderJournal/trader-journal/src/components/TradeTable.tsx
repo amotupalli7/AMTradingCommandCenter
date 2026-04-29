@@ -172,6 +172,16 @@ export function TradeTable({ trades, onRefresh }: TradeTableProps) {
     [trades]
   );
 
+  // All unique setups / sub-setups across every trade (for autocomplete)
+  const everySetup = useMemo(
+    () => unique(trades.map((t) => t.Setup).filter(Boolean)),
+    [trades]
+  );
+  const everySubSetup = useMemo(
+    () => unique(trades.map((t) => t["Sub-Setup"]).filter(Boolean)),
+    [trades]
+  );
+
   const filteredTrades = useMemo(() => {
     const afterShared = applyTradeFilters(trades, filters);
     const afterSearch = applySearch(afterShared, search);
@@ -609,7 +619,7 @@ export function TradeTable({ trades, onRefresh }: TradeTableProps) {
 
           {/* Scrollable Content */}
           <div className="flex-1 overflow-y-auto">
-            <TradeDetail key={selectedTrade["Trade ID"]} trade={selectedTrade} allTags={everyTag} allTriggers={everyTrigger} chartUrl={chartUrls[selectedTrade["Trade ID"]]} onSaved={onRefresh} />
+            <TradeDetail key={selectedTrade["Trade ID"]} trade={selectedTrade} allTags={everyTag} allTriggers={everyTrigger} allSetups={everySetup} allSubSetups={everySubSetup} chartUrl={chartUrls[selectedTrade["Trade ID"]]} onSaved={onRefresh} />
           </div>
         </div>
       )}
