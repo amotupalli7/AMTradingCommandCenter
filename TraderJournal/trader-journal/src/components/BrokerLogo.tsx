@@ -4,6 +4,7 @@ import { cn } from "@/lib/utils";
 const BROKER_LOGOS: Record<string, { src: string; alt: string }> = {
   SPTD: { src: "/SPTD.png", alt: "SpeedTrader" },
   TOS:  { src: "/TOS.png",  alt: "Schwab (TOS)" },
+  CBRA:  { src: "/CBRA.jpg",  alt: "Cobra" },
 };
 
 export function BrokerLogo({
