@@ -48,10 +48,11 @@ const EDITABLE_FIELD_TO_COLUMN: Record<EditableField, string> = {
 
 interface TradeRow {
   legacy_trade_id: number;
+  broker: string;
   date: Date;
   symbol: string;
   direction: string;
-  entry_time: string;
+  entry_time: string | null;
   entry_avg_price: string;
   net_pnl: string;
   r_net: string | null;
@@ -138,8 +139,9 @@ function str(v: string | null | undefined): string {
 function rowToTrade(r: TradeRow): Trade {
   return {
     "Trade ID": r.legacy_trade_id,
+    Broker: (r.broker as "SPTD" | "TOS"),
     Date: fmtDate(r.date),
-    "Enter Time": r.entry_time,
+    "Enter Time": r.entry_time ?? "",
     Ticker: r.symbol,
     Side: r.direction,
     Price: num(r.entry_avg_price),
@@ -218,7 +220,7 @@ function rowToExecution(r: ExecutionRow): Execution {
 // ---------------------------------------------------------------------------
 
 const TRADE_COLUMNS = `
-  legacy_trade_id, date, symbol, direction, entry_time, entry_avg_price,
+  legacy_trade_id, broker, date, symbol, direction, entry_time, entry_avg_price,
   net_pnl, r_net, win, win_override, x_score, acc_pct, risk_pct, dollar_risk,
   setup, sub_setup, trigger, tags,
   entry_notes, exit_notes, notes, mistake_notes, chart_url,

@@ -1,5 +1,8 @@
+export type Broker = "SPTD" | "TOS";
+
 export interface Trade {
   "Trade ID": number;
+  Broker: Broker;
   Date: string;
   "Enter Time": string;
   Ticker: string;

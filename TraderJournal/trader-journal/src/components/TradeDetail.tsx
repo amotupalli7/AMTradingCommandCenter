@@ -8,6 +8,7 @@ import {
   WinOverrideEditor,
   XFlagToggle,
 } from "./JournalEditors";
+import { BrokerLogo } from "./BrokerLogo";
 import { Badge } from "@/components/ui/badge";
 import { Input } from "@/components/ui/input";
 import { Skeleton } from "@/components/ui/skeleton";
@@ -55,6 +56,7 @@ export function TradeDetail({
       <div className="max-w-5xl mx-auto space-y-5">
         {/* Header */}
         <div className="flex items-center gap-3 flex-wrap">
+          <BrokerLogo broker={trade.Broker} size={24} />
           <h2 className="text-2xl font-bold text-white font-mono">
             {trade.Ticker}
           </h2>

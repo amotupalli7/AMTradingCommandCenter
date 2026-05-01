@@ -4,9 +4,11 @@ import { useState, useRef, useEffect, useMemo } from "react";
 import { cn } from "@/lib/utils";
 import { tagColor, parseTags } from "@/lib/tradeUtils";
 import { Trade } from "@/lib/types";
+import { BrokerLogo } from "./BrokerLogo";
 
 // ─── Filter state (exported so pages can share the type) ──────────────────────
 export interface TradeFilters {
+  broker: string;
   side: string;
   result: string;
   setups: string[];
@@ -21,6 +23,7 @@ export interface TradeFilters {
 }
 
 export const EMPTY_TRADE_FILTERS: TradeFilters = {
+  broker: "",
   side: "",
   result: "",
   setups: [],
@@ -45,6 +48,7 @@ export function applyTradeFilters(trades: Trade[], f: TradeFilters): Trade[] {
   const excludeTags = f.excludeTags.map((t) => t.toLowerCase());
 
   return trades.filter((trade) => {
+    if (f.broker && trade.Broker !== f.broker) return false;
     if (f.side) {
       const isLong = isLongSide(trade.Side);
       if (f.side === "Long" && !isLong) return false;
@@ -169,6 +173,7 @@ export function FilterBar({ trades, filters, onChange, totalCount, filteredCount
     set({ excludeTags: filters.excludeTags.includes(v) ? filters.excludeTags.filter((x) => x !== v) : [...filters.excludeTags, v] });
 
   const activeCount =
+    (filters.broker ? 1 : 0) +
     (filters.side ? 1 : 0) +
     (filters.result ? 1 : 0) +
     filters.setups.length +
@@ -186,6 +191,9 @@ export function FilterBar({ trades, filters, onChange, totalCount, filteredCount
     <div className="space-y-2">
       {/* Row */}
       <div className="flex flex-wrap gap-2 items-center">
+        {/* Broker */}
+        <BrokerSelect value={filters.broker} onChange={(b) => set({ broker: b })} />
+
         {/* Side */}
         <select
           value={filters.side}
@@ -308,6 +316,9 @@ export function FilterBar({ trades, filters, onChange, totalCount, filteredCount
       {hasActive && (
         <div className="flex flex-wrap gap-1.5 items-center">
           <span className="text-[10px] text-slate-600 uppercase tracking-wider">Filters:</span>
+          {filters.broker && (
+            <ActiveBadge label={`Broker: ${filters.broker}`} onRemove={() => set({ broker: "" })} />
+          )}
           {filters.side && (
             <ActiveBadge label={filters.side} onRemove={() => set({ side: "" })} />
           )}
@@ -490,5 +501,45 @@ function ActiveBadge({
       {label}
       <span className="opacity-50">&times;</span>
     </button>
+  );
+}
+
+// ─── Broker pill segmented control ───────────────────────────────────────────
+function BrokerSelect({
+  value,
+  onChange,
+}: {
+  value: string;
+  onChange: (v: string) => void;
+}) {
+  const Btn = ({
+    v,
+    children,
+    title,
+  }: {
+    v: string;
+    children: React.ReactNode;
+    title: string;
+  }) => (
+    <button
+      type="button"
+      onClick={() => onChange(v)}
+      title={title}
+      className={cn(
+        "px-2 h-9 inline-flex items-center justify-center text-xs transition-colors border-r last:border-r-0 border-slate-700",
+        value === v
+          ? "bg-blue-600/20 text-white border-blue-500/30"
+          : "bg-slate-900/50 text-slate-400 hover:text-white hover:bg-slate-800"
+      )}
+    >
+      {children}
+    </button>
+  );
+  return (
+    <div className="inline-flex rounded-md border border-slate-700 overflow-hidden">
+      <Btn v="" title="All brokers">All</Btn>
+      <Btn v="SPTD" title="SpeedTrader"><BrokerLogo broker="SPTD" size={18} /></Btn>
+      <Btn v="TOS" title="Schwab (TOS)"><BrokerLogo broker="TOS" size={18} /></Btn>
+    </div>
   );
 }

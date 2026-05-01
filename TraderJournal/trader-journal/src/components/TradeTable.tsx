@@ -4,6 +4,7 @@ import { useState, useCallback, useRef, useEffect, useMemo } from "react";
 import { forwardRef } from "react";
 import { Trade } from "@/lib/types";
 import { TradeDetail } from "./TradeDetail";
+import { BrokerLogo } from "./BrokerLogo";
 import { useKeyboardNav } from "@/hooks/useKeyboardNav";
 import { useFilters } from "@/context/FilterContext";
 import { TradeFilters, EMPTY_TRADE_FILTERS, applyTradeFilters } from "@/components/FilterBar";
@@ -846,7 +847,12 @@ const TradeRow = forwardRef<HTMLTableRowElement, TradeRowProps>(
         )}
       >
         <td className="px-4 py-3 text-slate-300 whitespace-nowrap">{trade.Date}</td>
-        <td className="px-4 py-3 font-mono font-semibold text-white whitespace-nowrap">{trade.Ticker}</td>
+        <td className="px-4 py-3 font-mono font-semibold text-white whitespace-nowrap">
+          <span className="inline-flex items-center gap-1.5">
+            <BrokerLogo broker={trade.Broker} size={14} />
+            {trade.Ticker}
+          </span>
+        </td>
         <td className="px-4 py-3">
           <Badge
             variant="outline"

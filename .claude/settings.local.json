@@ -1,7 +1,8 @@
 {
   "permissions": {
     "allow": [
-      "Bash(python ingest_trades.py --force 3-27-26)"
+      "Bash(python ingest_trades.py --force 3-27-26)",
+      "Bash(python -c ' *)"
     ]
   }
 }

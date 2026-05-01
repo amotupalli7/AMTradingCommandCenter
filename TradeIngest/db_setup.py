@@ -151,6 +151,70 @@ SCHEMA_DDL = [
     "ALTER TABLE trades ADD COLUMN IF NOT EXISTS legacy_trade_id INTEGER",
     "CREATE UNIQUE INDEX IF NOT EXISTS idx_trades_legacy_id ON trades(legacy_trade_id) WHERE legacy_trade_id IS NOT NULL",
 
+    # broker: which broker the trade/execution came from. Cross-day stitching
+    # is scoped to (broker, symbol). Existing rows backfill to 'SPTD'.
+    "ALTER TABLE raw_executions ADD COLUMN IF NOT EXISTS broker TEXT",
+    "ALTER TABLE trades         ADD COLUMN IF NOT EXISTS broker TEXT",
+    "UPDATE raw_executions SET broker = 'SPTD' WHERE broker IS NULL",
+    "UPDATE trades         SET broker = 'SPTD' WHERE broker IS NULL",
+    "ALTER TABLE raw_executions ALTER COLUMN broker SET NOT NULL",
+    "ALTER TABLE trades         ALTER COLUMN broker SET NOT NULL",
+    # Defaults so future inserts that omit broker still classify as SPTD
+    "ALTER TABLE raw_executions ALTER COLUMN broker SET DEFAULT 'SPTD'",
+    "ALTER TABLE trades         ALTER COLUMN broker SET DEFAULT 'SPTD'",
+    # TOS rows have no time -> drop the NOT NULL on raw_executions.time
+    # and on trades.entry_time / trades.exit_time
+    "ALTER TABLE raw_executions ALTER COLUMN time DROP NOT NULL",
+    "ALTER TABLE trades ALTER COLUMN entry_time DROP NOT NULL",
+    "ALTER TABLE trades ALTER COLUMN exit_time  DROP NOT NULL",
+
+    # Re-scope unique constraints to include broker. Old constraints are
+    # dropped IF EXISTS so a fresh DB picks up only the new ones.
+    "ALTER TABLE trades DROP CONSTRAINT IF EXISTS trades_date_symbol_trade_index_key",
+    "ALTER TABLE raw_executions DROP CONSTRAINT IF EXISTS raw_executions_date_time_symbol_side_price_qty_route_key",
+    """
+    DO $$ BEGIN
+        IF NOT EXISTS (
+            SELECT 1 FROM pg_constraint
+            WHERE conname = 'trades_broker_date_symbol_trade_index_key'
+        ) THEN
+            ALTER TABLE trades ADD CONSTRAINT trades_broker_date_symbol_trade_index_key
+                UNIQUE (broker, date, symbol, trade_index);
+        END IF;
+    END $$
+    """,
+    """
+    DO $$ BEGIN
+        IF NOT EXISTS (
+            SELECT 1 FROM pg_constraint
+            WHERE conname = 'raw_executions_broker_dttsspqr_key'
+        ) THEN
+            ALTER TABLE raw_executions ADD CONSTRAINT raw_executions_broker_dttsspqr_key
+                UNIQUE (broker, date, time, symbol, side, price, qty, route);
+        END IF;
+    END $$
+    """,
+
+    # account_events: non-trade rows from broker history (fees, splits, expirations).
+    # raw_row_hash dedupes if the source file is re-imported.
+    """
+    CREATE TABLE IF NOT EXISTS account_events (
+        id            BIGSERIAL PRIMARY KEY,
+        broker        TEXT          NOT NULL,
+        date          DATE          NOT NULL,
+        action        TEXT          NOT NULL,    -- 'Service Fee', 'Margin Interest', 'Reverse Split', 'Expired'
+        symbol        TEXT,
+        description   TEXT,
+        quantity      NUMERIC(14,4),
+        price         NUMERIC(12,4),
+        fees          NUMERIC(10,4),
+        amount        NUMERIC(14,4),
+        raw_row_hash  TEXT          NOT NULL,
+        UNIQUE (broker, raw_row_hash)
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_account_events_date ON account_events(broker, date)",
+
     # trade_journal: 1:1 with trades, keyed on legacy_trade_id. Holds all
     # manual journaling fields previously in trades.xlsx (both tabs) plus
     # per-trade $ Risk imported from Executions tab.
@@ -211,6 +275,7 @@ WITH per_trade AS (
     SELECT
         t.id                                AS trade_id,
         t.legacy_trade_id,
+        t.broker,
         t.date,
         t.symbol,
         t.direction,
