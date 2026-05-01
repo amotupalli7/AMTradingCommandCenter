@@ -178,16 +178,19 @@ def load_fees(ar_path, trade_date):
 
 def load_locates_file(path, default_date=None):
     """
-    Load a locates CSV. Two formats are supported:
-      - Newer (consolidated): columns Date, Symbol, Shares, Cost
-      - Older (per-day):       columns Symbol, Shares, Cost (date from filename)
-    `default_date` is required to parse the older per-day format.
+    Load a locates file. Three formats are supported:
+      - Consolidated CSV: columns Date, Symbol, Shares, Cost
+      - SPTD per-day CSV: columns Symbol, Shares, Cost (date from filename)
+      - CBRA per-day _L (no extension): same as SPTD per-day, plus a final
+        TOTAL: row that we skip.
+    `default_date` is required to parse per-day formats.
     """
     rows = []
     with open(path, "r", newline="") as f:
         reader = csv.DictReader(f)
         for row in reader:
-            if not row.get("Symbol", "").strip():
+            symbol = row.get("Symbol", "").strip()
+            if not symbol or symbol.upper().startswith("TOTAL"):
                 continue
             if "Date" in row and row["Date"]:
                 row_date = parse_us_date(row["Date"])
@@ -199,7 +202,7 @@ def load_locates_file(path, default_date=None):
                 )
             rows.append({
                 "date": row_date,
-                "symbol": row["Symbol"].strip().upper(),
+                "symbol": symbol.upper(),
                 "shares": int(row["Shares"]),
                 "cost": float(row["Cost"]),
             })
@@ -633,11 +636,27 @@ def insert_locates(cur, locate_rows):
 # Main pipeline
 # ---------------------------------------------------------------------------
 
-def process_day(conn, date_prefix, force=False):
+def broker_from_data_dir(data_dir):
+    """Infer broker code from the folder name's first whitespace token.
+    'CBRA 2026' -> 'CBRA'; 'SPTD 2025' -> 'SPTD'. Defaults to 'SPTD' if empty."""
+    name = Path(data_dir).name.strip()
+    if not name:
+        return "SPTD"
+    return name.split()[0].upper()
+
+
+def process_day(conn, date_prefix, force=False, broker=None):
     """Process one trading day. Wraps everything in a single transaction."""
+    if broker is None:
+        broker = broker_from_data_dir(DATA_DIR)
+
     csv_path = DATA_DIR / f"{date_prefix}.csv"
     ar_path = DATA_DIR / f"{date_prefix}_AR.csv"
-    locates_path = DATA_DIR / f"{date_prefix}_locates.csv"
+    # Locate file lookup: prefer M-D-YY_locates.csv (legacy SPTD format) but
+    # also accept M-D-YY_L (CBRA format, no extension).
+    locates_csv = DATA_DIR / f"{date_prefix}_locates.csv"
+    locates_l   = DATA_DIR / f"{date_prefix}_L"
+    locates_path = locates_csv if locates_csv.exists() else (locates_l if locates_l.exists() else None)
 
     if not csv_path.exists():
         print(f"  ERROR: {csv_path} not found, skipping.")
@@ -646,7 +665,7 @@ def process_day(conn, date_prefix, force=False):
         print(f"  WARNING: {ar_path} not found, processing without fees.")
 
     trade_date = parse_date_from_filename(date_prefix + ".csv")
-    print(f"\n  Processing {date_prefix} -> {trade_date}")
+    print(f"\n  Processing {date_prefix} -> {trade_date} [broker={broker}]")
 
     try:
         with conn:  # commits on success, rolls back on exception
@@ -657,25 +676,25 @@ def process_day(conn, date_prefix, force=False):
                     # notes survive a re-ingest. The corresponding trade_journal
                     # rows are intentionally NOT deleted - they get re-attached
                     # to the new trades.id via the preserved legacy_trade_id.
-                    # Scoped to broker='SPTD' so a TOS day on the same date isn't touched.
+                    # Scoped to this broker so other brokers' data on the same date isn't touched.
                     cur.execute("""
                         SELECT symbol, trade_index, legacy_trade_id
                         FROM trades
-                        WHERE broker = 'SPTD' AND date = %s AND legacy_trade_id IS NOT NULL
-                    """, (trade_date,))
+                        WHERE broker = %s AND date = %s AND legacy_trade_id IS NOT NULL
+                    """, (broker, trade_date))
                     legacy_snapshot = {(s, idx): lid for s, idx, lid in cur.fetchall()}
                     if legacy_snapshot:
                         print(f"  Preserving {len(legacy_snapshot)} legacy_trade_id(s) "
                               f"across re-ingest")
 
-                    cur.execute("DELETE FROM trade_executions WHERE trade_id IN (SELECT id FROM trades WHERE broker='SPTD' AND date=%s)", (trade_date,))
-                    cur.execute("DELETE FROM trades WHERE broker='SPTD' AND date=%s", (trade_date,))
-                    cur.execute("DELETE FROM raw_executions WHERE broker='SPTD' AND date=%s", (trade_date,))
+                    cur.execute("DELETE FROM trade_executions WHERE trade_id IN (SELECT id FROM trades WHERE broker=%s AND date=%s)", (broker, trade_date))
+                    cur.execute("DELETE FROM trades WHERE broker=%s AND date=%s", (broker, trade_date))
+                    cur.execute("DELETE FROM raw_executions WHERE broker=%s AND date=%s", (broker, trade_date))
                     cur.execute("DELETE FROM daily_fees WHERE date=%s", (trade_date,))
                     cur.execute("DELETE FROM locates WHERE date=%s", (trade_date,))
                     print("  Cleared existing data for this date (--force)")
 
-                cur.execute("SELECT COUNT(*) FROM raw_executions WHERE broker='SPTD' AND date = %s", (trade_date,))
+                cur.execute("SELECT COUNT(*) FROM raw_executions WHERE broker=%s AND date = %s", (broker, trade_date))
                 existing = cur.fetchone()[0]
                 if existing > 0:
                     print(f"  Already ingested ({existing} executions). Skipping. Use --force to re-process.")
@@ -690,11 +709,11 @@ def process_day(conn, date_prefix, force=False):
                     print(f"  Loaded fees for {len(fee_rows)} symbols")
 
                 locate_rows = []
-                if locates_path.exists():
+                if locates_path is not None:
                     locate_rows = load_locates_file(str(locates_path), default_date=trade_date)
-                    print(f"  Loaded {len(locate_rows)} locates")
+                    print(f"  Loaded {len(locate_rows)} locates from {locates_path.name}")
 
-                trades = group_into_trades(executions, trade_date, cur=cur)
+                trades = group_into_trades(executions, trade_date, cur=cur, broker=broker)
                 print(f"  Grouped into {len(trades)} trades:")
                 for t in trades:
                     status = " (UNCLOSED)" if t.get("unclosed") else ""
@@ -724,9 +743,9 @@ def process_day(conn, date_prefix, force=False):
 
                 allocate_fees(trades, fee_rows, prior_fees_by_trade=prior_fees_by_trade)
 
-                execution_ids = insert_executions(cur, executions)
+                execution_ids = insert_executions(cur, executions, broker=broker)
                 insert_fees(cur, fee_rows)
-                insert_trades(cur, trades, execution_ids, legacy_snapshot=legacy_snapshot)
+                insert_trades(cur, trades, execution_ids, legacy_snapshot=legacy_snapshot, broker=broker)
                 if locate_rows:
                     n = insert_locates(cur, locate_rows)
                     print(f"  Inserted {n} new locate rows")
