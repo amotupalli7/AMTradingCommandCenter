@@ -178,7 +178,7 @@ function rowToExecution(r: ExecutionRow): Execution {
   return {
     "Trade ID": r.legacy_trade_id,
     Date: fmtDate(r.date),
-    "Enter Time": r.entry_time,
+    "Enter Time": r.entry_time ?? "",
     "Symbol / Ticker": r.symbol,
     Side: r.direction,
     Price: num(r.entry_avg_price),
@@ -338,42 +338,42 @@ export async function updateTradeField(
 export interface DailyAccountRow {
   date: string;            // YYYY-MM-DD
   account_value: number | null;
-  goal_R: number | null;
+  dollar_risk: number | null;
 }
 
 interface DailyAccountDbRow {
   date: Date;
   account_value: string | null;
-  goal_r: string | null;
+  dollar_risk: string | null;
 }
 
 export async function readDailyAccount(): Promise<DailyAccountRow[]> {
   const rows = await query<DailyAccountDbRow>(
-    `SELECT date, account_value, goal_R FROM daily_account ORDER BY date DESC`
+    `SELECT date, account_value, dollar_risk FROM daily_account ORDER BY date DESC`
   );
   return rows.map((r) => ({
     date: fmtDate(r.date),
     account_value: r.account_value === null ? null : Number(r.account_value),
-    goal_R: r.goal_r === null ? null : Number(r.goal_r),
+    dollar_risk: r.dollar_risk === null ? null : Number(r.dollar_risk),
   }));
 }
 
 export async function upsertDailyAccount(
   date: string,
   accountValue: number | null,
-  goalR: number | null
+  dollarRisk: number | null
 ): Promise<{ success: boolean; error?: string }> {
   if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) {
     return { success: false, error: `Invalid date "${date}", expected YYYY-MM-DD` };
   }
   try {
     await query(
-      `INSERT INTO daily_account (date, account_value, goal_R)
+      `INSERT INTO daily_account (date, account_value, dollar_risk)
        VALUES ($1, $2, $3)
        ON CONFLICT (date) DO UPDATE SET
          account_value = EXCLUDED.account_value,
-         goal_R        = EXCLUDED.goal_R`,
-      [date, accountValue, goalR]
+         dollar_risk   = EXCLUDED.dollar_risk`,
+      [date, accountValue, dollarRisk]
     );
     return { success: true };
   } catch (err) {

@@ -7,7 +7,7 @@ import { TradeDetail } from "./TradeDetail";
 import { BrokerLogo } from "./BrokerLogo";
 import { useKeyboardNav } from "@/hooks/useKeyboardNav";
 import { useFilters } from "@/context/FilterContext";
-import { TradeFilters, EMPTY_TRADE_FILTERS, applyTradeFilters } from "@/components/FilterBar";
+import { TradeFilters, EMPTY_TRADE_FILTERS, applyTradeFilters, UNJOURNALED_OPTION } from "@/components/FilterBar";
 import { Badge } from "@/components/ui/badge";
 import { Input } from "@/components/ui/input";
 import { cn } from "@/lib/utils";
@@ -196,20 +196,28 @@ export function TradeTable({ trades, onRefresh }: TradeTableProps) {
     dateFrom: filters.dateFrom, dateTo: filters.dateTo,
   }), [trades, filters.side, filters.result, filters.dateFrom, filters.dateTo]);
 
-  const allSetups = useMemo(
-    () => unique(afterSideResultDate.map((t) => t.Setup)),
-    [afterSideResultDate]
-  );
+  const withUnjournaled = (options: string[], raw: string[]): string[] => {
+    const hasBlank = raw.some((v) => !v || v.trim() === "");
+    if (!hasBlank) return options;
+    const sentinelKey = UNJOURNALED_OPTION.toLowerCase();
+    if (options.some((o) => o.toLowerCase() === sentinelKey)) return options;
+    return [...options, UNJOURNALED_OPTION];
+  };
+
+  const allSetups = useMemo(() => {
+    const raw = afterSideResultDate.map((t) => t.Setup);
+    return withUnjournaled(unique(raw), raw);
+  }, [afterSideResultDate]);
 
   const afterSetups = useMemo(() => applyTradeFilters(trades, {
     ...EMPTY_TRADE_FILTERS, side: filters.side, result: filters.result,
     dateFrom: filters.dateFrom, dateTo: filters.dateTo, setups: filters.setups,
   }), [trades, filters.side, filters.result, filters.dateFrom, filters.dateTo, filters.setups]);
 
-  const allSubSetups = useMemo(
-    () => unique(afterSetups.map((t) => t["Sub-Setup"])),
-    [afterSetups]
-  );
+  const allSubSetups = useMemo(() => {
+    const raw = afterSetups.map((t) => t["Sub-Setup"]);
+    return withUnjournaled(unique(raw), raw);
+  }, [afterSetups]);
 
   const afterSubSetups = useMemo(() => applyTradeFilters(trades, {
     ...EMPTY_TRADE_FILTERS, side: filters.side, result: filters.result,
@@ -217,10 +225,10 @@ export function TradeTable({ trades, onRefresh }: TradeTableProps) {
     setups: filters.setups, subSetups: filters.subSetups,
   }), [trades, filters.side, filters.result, filters.dateFrom, filters.dateTo, filters.setups, filters.subSetups]);
 
-  const allTriggers = useMemo(
-    () => unique(afterSubSetups.map((t) => t.Trigger).filter(Boolean)),
-    [afterSubSetups]
-  );
+  const allTriggers = useMemo(() => {
+    const raw = afterSubSetups.map((t) => t.Trigger ?? "");
+    return withUnjournaled(unique(raw), raw);
+  }, [afterSubSetups]);
 
   const afterTriggers = useMemo(() => applyTradeFilters(trades, {
     ...EMPTY_TRADE_FILTERS, side: filters.side, result: filters.result,
@@ -228,10 +236,14 @@ export function TradeTable({ trades, onRefresh }: TradeTableProps) {
     setups: filters.setups, subSetups: filters.subSetups, triggers: filters.triggers,
   }), [trades, filters.side, filters.result, filters.dateFrom, filters.dateTo, filters.setups, filters.subSetups, filters.triggers]);
 
-  const allTags = useMemo(
-    () => unique(afterTriggers.flatMap((t) => parseTags(t.Tags))),
-    [afterTriggers]
-  );
+  const allTags = useMemo(() => {
+    const named = unique(afterTriggers.flatMap((t) => parseTags(t.Tags)));
+    const hasUntagged = afterTriggers.some((t) => parseTags(t.Tags).length === 0);
+    if (!hasUntagged) return named;
+    const sentinelKey = UNJOURNALED_OPTION.toLowerCase();
+    if (named.some((t) => t.toLowerCase() === sentinelKey)) return named;
+    return [...named, UNJOURNALED_OPTION];
+  }, [afterTriggers]);
 
   // Clicking a sortable column: if already active, flip direction; else switch to it (desc first)
   const handleSort = useCallback((key: SortKey) => {

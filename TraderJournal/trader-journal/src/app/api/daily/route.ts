@@ -20,7 +20,7 @@ export async function GET() {
 export async function PUT(request: NextRequest) {
   try {
     const body = await request.json();
-    const { date, account_value, goal_R } = body;
+    const { date, account_value, dollar_risk } = body;
 
     if (typeof date !== "string") {
       return NextResponse.json({ error: "date is required" }, { status: 400 });
@@ -30,19 +30,19 @@ export async function PUT(request: NextRequest) {
       account_value === null || account_value === undefined || account_value === ""
         ? null
         : Number(account_value);
-    const gr =
-      goal_R === null || goal_R === undefined || goal_R === ""
+    const dr =
+      dollar_risk === null || dollar_risk === undefined || dollar_risk === ""
         ? null
-        : Number(goal_R);
+        : Number(dollar_risk);
 
     if (av !== null && !Number.isFinite(av)) {
       return NextResponse.json({ error: "account_value must be numeric" }, { status: 400 });
     }
-    if (gr !== null && !Number.isFinite(gr)) {
-      return NextResponse.json({ error: "goal_R must be numeric" }, { status: 400 });
+    if (dr !== null && (!Number.isFinite(dr) || dr < 0)) {
+      return NextResponse.json({ error: "dollar_risk must be a non-negative number" }, { status: 400 });
     }
 
-    const result = await upsertDailyAccount(date, av, gr);
+    const result = await upsertDailyAccount(date, av, dr);
     if (!result.success) {
       return NextResponse.json({ error: result.error }, { status: 500 });
     }

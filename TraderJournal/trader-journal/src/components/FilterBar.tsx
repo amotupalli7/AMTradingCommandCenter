@@ -40,12 +40,19 @@ export const EMPTY_TRADE_FILTERS: TradeFilters = {
 // ─── Apply filters to a trades array ─────────────────────────────────────────
 import { isLongSide } from "@/lib/tradeUtils";
 
+// Sentinel option in the Setup/Sub-Setup/Trigger/Tags dropdowns that matches
+// trades whose corresponding field is blank (e.g. freshly-ingested CBRA trades
+// that haven't been journaled yet). Picking "None" keeps them in the result;
+// not picking it filters them out, just like any real value.
+export const UNJOURNALED_OPTION = "None";
+
 export function applyTradeFilters(trades: Trade[], f: TradeFilters): Trade[] {
   const filterSetups = f.setups.map((s) => s.toLowerCase());
   const filterSubSetups = f.subSetups.map((s) => s.toLowerCase());
   const filterTriggers = f.triggers.map((t) => t.toLowerCase());
   const filterTags = f.tags.map((t) => t.toLowerCase());
   const excludeTags = f.excludeTags.map((t) => t.toLowerCase());
+  const noneKey = UNJOURNALED_OPTION.toLowerCase();
 
   return trades.filter((trade) => {
     if (f.broker && trade.Broker !== f.broker) return false;
@@ -56,13 +63,26 @@ export function applyTradeFilters(trades: Trade[], f: TradeFilters): Trade[] {
     }
     if (f.result === "win" && trade.Win !== 1) return false;
     if (f.result === "loss" && trade.Win !== 0) return false;
-    if (filterSetups.length > 0 && !filterSetups.includes(trade.Setup.toLowerCase())) return false;
-    if (filterSubSetups.length > 0 && !filterSubSetups.includes(trade["Sub-Setup"].toLowerCase())) return false;
-    if (filterTriggers.length > 0 && !filterTriggers.includes((trade.Trigger || "").toLowerCase())) return false;
+    if (filterSetups.length > 0) {
+      const v = trade.Setup.toLowerCase();
+      const key = v === "" ? noneKey : v;
+      if (!filterSetups.includes(key)) return false;
+    }
+    if (filterSubSetups.length > 0) {
+      const v = trade["Sub-Setup"].toLowerCase();
+      const key = v === "" ? noneKey : v;
+      if (!filterSubSetups.includes(key)) return false;
+    }
+    if (filterTriggers.length > 0) {
+      const v = (trade.Trigger || "").toLowerCase();
+      const key = v === "" ? noneKey : v;
+      if (!filterTriggers.includes(key)) return false;
+    }
     if (filterTags.length > 0 || excludeTags.length > 0) {
       const tradeTags = parseTags(trade.Tags).map((t) => t.toLowerCase());
-      if (filterTags.length > 0 && !filterTags.some((t) => tradeTags.includes(t))) return false;
-      if (excludeTags.length > 0 && excludeTags.some((t) => tradeTags.includes(t))) return false;
+      const tagKeys = tradeTags.length === 0 ? [noneKey] : tradeTags;
+      if (filterTags.length > 0 && !filterTags.some((t) => tagKeys.includes(t))) return false;
+      if (excludeTags.length > 0 && excludeTags.some((t) => tagKeys.includes(t))) return false;
     }
     if (f.dateFrom && trade.Date < f.dateFrom) return false;
     if (f.dateTo && trade.Date > f.dateTo) return false;
@@ -84,6 +104,22 @@ function unique(arr: string[]): string[] {
   );
 }
 
+/**
+ * Append the UNJOURNALED_OPTION sentinel to an option list when at least one
+ * source value was blank. The sentinel is pinned to the end of the list so it
+ * doesn't push real options around as filters cascade. If a real value already
+ * collides with the sentinel name (e.g. a literal "None" setup) we keep the
+ * existing option and skip adding a duplicate.
+ */
+function withUnjournaled(options: string[], rawValues: string[]): string[] {
+  const hasBlank = rawValues.some((v) => !v || v.trim() === "");
+  if (!hasBlank) return options;
+  const sentinelKey = UNJOURNALED_OPTION.toLowerCase();
+  const alreadyHas = options.some((o) => o.toLowerCase() === sentinelKey);
+  if (alreadyHas) return options;
+  return [...options, UNJOURNALED_OPTION];
+}
+
 // ─── FilterBar component ──────────────────────────────────────────────────────
 interface FilterBarProps {
   trades: Trade[]; // all trades (for populating option lists)
@@ -102,20 +138,20 @@ export function FilterBar({ trades, filters, onChange, totalCount, filteredCount
     dateFrom: filters.dateFrom, dateTo: filters.dateTo,
   }), [trades, filters.side, filters.result, filters.dateFrom, filters.dateTo]);
 
-  const allSetups = useMemo(
-    () => unique(afterSideResultDate.map((t) => t.Setup)),
-    [afterSideResultDate]
-  );
+  const allSetups = useMemo(() => {
+    const raw = afterSideResultDate.map((t) => t.Setup);
+    return withUnjournaled(unique(raw), raw);
+  }, [afterSideResultDate]);
 
   const afterSetups = useMemo(() => applyTradeFilters(trades, {
     ...EMPTY_TRADE_FILTERS, side: filters.side, result: filters.result,
     dateFrom: filters.dateFrom, dateTo: filters.dateTo, setups: filters.setups,
   }), [trades, filters.side, filters.result, filters.dateFrom, filters.dateTo, filters.setups]);
 
-  const allSubSetups = useMemo(
-    () => unique(afterSetups.map((t) => t["Sub-Setup"])),
-    [afterSetups]
-  );
+  const allSubSetups = useMemo(() => {
+    const raw = afterSetups.map((t) => t["Sub-Setup"]);
+    return withUnjournaled(unique(raw), raw);
+  }, [afterSetups]);
 
   const afterSubSetups = useMemo(() => applyTradeFilters(trades, {
     ...EMPTY_TRADE_FILTERS, side: filters.side, result: filters.result,
@@ -123,10 +159,10 @@ export function FilterBar({ trades, filters, onChange, totalCount, filteredCount
     setups: filters.setups, subSetups: filters.subSetups,
   }), [trades, filters.side, filters.result, filters.dateFrom, filters.dateTo, filters.setups, filters.subSetups]);
 
-  const allTriggers = useMemo(
-    () => unique(afterSubSetups.map((t) => t.Trigger).filter(Boolean)),
-    [afterSubSetups]
-  );
+  const allTriggers = useMemo(() => {
+    const raw = afterSubSetups.map((t) => t.Trigger ?? "");
+    return withUnjournaled(unique(raw), raw);
+  }, [afterSubSetups]);
 
   const afterTriggers = useMemo(() => applyTradeFilters(trades, {
     ...EMPTY_TRADE_FILTERS, side: filters.side, result: filters.result,
@@ -134,10 +170,14 @@ export function FilterBar({ trades, filters, onChange, totalCount, filteredCount
     setups: filters.setups, subSetups: filters.subSetups, triggers: filters.triggers,
   }), [trades, filters.side, filters.result, filters.dateFrom, filters.dateTo, filters.setups, filters.subSetups, filters.triggers]);
 
-  const allTags = useMemo(
-    () => unique(afterTriggers.flatMap((t) => parseTags(t.Tags))),
-    [afterTriggers]
-  );
+  const allTags = useMemo(() => {
+    const named = unique(afterTriggers.flatMap((t) => parseTags(t.Tags)));
+    const hasUntagged = afterTriggers.some((t) => parseTags(t.Tags).length === 0);
+    if (!hasUntagged) return named;
+    const sentinelKey = UNJOURNALED_OPTION.toLowerCase();
+    if (named.some((t) => t.toLowerCase() === sentinelKey)) return named;
+    return [...named, UNJOURNALED_OPTION];
+  }, [afterTriggers]);
 
   // Drop selected values that are no longer valid after upstream changes
   useEffect(() => {
@@ -540,6 +580,7 @@ function BrokerSelect({
       <Btn v="" title="All brokers">All</Btn>
       <Btn v="SPTD" title="SpeedTrader"><BrokerLogo broker="SPTD" size={18} /></Btn>
       <Btn v="TOS" title="Schwab (TOS)"><BrokerLogo broker="TOS" size={18} /></Btn>
+      <Btn v="CBRA" title="Cobra"><BrokerLogo broker="CBRA" size={18} /></Btn>
     </div>
   );
 }

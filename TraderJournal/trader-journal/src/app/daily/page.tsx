@@ -8,7 +8,7 @@ import { cn } from "@/lib/utils";
 interface DailyRow {
   date: string;
   account_value: number | null;
-  goal_R: number | null;
+  dollar_risk: number | null;
 }
 
 function todayISO(): string {
@@ -27,7 +27,7 @@ export default function DailyPage() {
   // Form state
   const [date, setDate] = useState(todayISO());
   const [accountValue, setAccountValue] = useState("");
-  const [goalR, setGoalR] = useState("");
+  const [dollarRisk, setDollarRisk] = useState("");
   const [saving, setSaving] = useState(false);
   const [savedAt, setSavedAt] = useState<number | null>(null);
 
@@ -50,15 +50,23 @@ export default function DailyPage() {
     load();
   }, [load]);
 
-  // When the user picks a date that already has a row, prefill the form
+  // When the user picks a date that already has a row, prefill the form.
+  // Otherwise prefill with the most-recent prior values (the carry-forward
+  // baseline) so editing feels natural.
   useEffect(() => {
     const existing = rows.find((r) => r.date === date);
     if (existing) {
       setAccountValue(existing.account_value === null ? "" : String(existing.account_value));
-      setGoalR(existing.goal_R === null ? "" : String(existing.goal_R));
+      setDollarRisk(existing.dollar_risk === null ? "" : String(existing.dollar_risk));
+      return;
+    }
+    const carry = rows.find((r) => r.date < date);
+    if (carry) {
+      setAccountValue(carry.account_value === null ? "" : String(carry.account_value));
+      setDollarRisk(carry.dollar_risk === null ? "" : String(carry.dollar_risk));
     } else {
       setAccountValue("");
-      setGoalR("");
+      setDollarRisk("");
     }
   }, [date, rows]);
 
@@ -73,7 +81,7 @@ export default function DailyPage() {
         body: JSON.stringify({
           date,
           account_value: accountValue === "" ? null : Number(accountValue),
-          goal_R: goalR === "" ? null : Number(goalR),
+          dollar_risk: dollarRisk === "" ? null : Number(dollarRisk),
         }),
       });
       if (!resp.ok) {
@@ -113,8 +121,10 @@ export default function DailyPage() {
       <div>
         <h1 className="text-2xl font-bold text-white">Daily Inputs</h1>
         <p className="text-sm text-slate-400 mt-1">
-          Per-day account_value and goal_R. Risk % and Acc % on each trade are
-          computed against the account_value for that trade&apos;s date.
+          Per-day Account Value and $ Risk. Both carry forward: trades on a
+          given date use the most recent on-or-before entry until you set a
+          new one. A per-trade $ Risk on the trade detail page overrides this
+          for that single trade.
         </p>
       </div>
 
@@ -153,14 +163,15 @@ export default function DailyPage() {
               className="h-9 w-40 bg-transparent border-slate-700 text-sm"
             />
           </Field>
-          <Field label="Goal R">
+          <Field label="$ Risk">
             <Input
               type="number"
               step="0.01"
-              value={goalR}
-              onChange={(e) => setGoalR(e.target.value)}
-              placeholder="2"
-              className="h-9 w-28 bg-transparent border-slate-700 text-sm"
+              min="0"
+              value={dollarRisk}
+              onChange={(e) => setDollarRisk(e.target.value)}
+              placeholder="80.00"
+              className="h-9 w-32 bg-transparent border-slate-700 text-sm"
             />
           </Field>
           <Button type="submit" disabled={saving} className="h-9">
@@ -188,7 +199,7 @@ export default function DailyPage() {
               <tr className="text-xs text-slate-500 uppercase tracking-wider border-b border-slate-800">
                 <Th>Date</Th>
                 <Th align="right">Account Value</Th>
-                <Th align="right">Goal R</Th>
+                <Th align="right">$ Risk</Th>
                 <Th align="right">Actions</Th>
               </tr>
             </thead>
@@ -223,7 +234,9 @@ export default function DailyPage() {
                       : `$${row.account_value.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`}
                   </Td>
                   <Td align="right" className="font-mono">
-                    {row.goal_R === null ? "—" : row.goal_R.toFixed(2)}
+                    {row.dollar_risk === null
+                      ? "—"
+                      : `$${row.dollar_risk.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`}
                   </Td>
                   <Td align="right">
                     <button

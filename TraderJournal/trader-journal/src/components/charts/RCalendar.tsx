@@ -8,7 +8,7 @@ interface RCalendarProps {
   data: Record<string, number>; // "YYYY-MM-DD" → daily Net R total
 }
 
-const DAY_LABELS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
+const DAY_LABELS = ["Mon", "Tue", "Wed", "Thu", "Fri"];
 
 function pad(n: number) {
   return String(n).padStart(2, "0");
@@ -18,20 +18,30 @@ function toDateStr(y: number, m: number, d: number) {
   return `${y}-${pad(m + 1)}-${pad(d)}`;
 }
 
-/** Get cells for a month grid (Monday-start). Returns array of 42 slots (6 weeks). */
+/** Get cells for a Mon–Fri month grid. Weekend days are skipped entirely. */
 function getMonthGrid(year: number, month: number) {
   const firstDay = new Date(year, month, 1);
-  // getDay() → 0=Sun, convert to Mon-start: Mon=0 … Sun=6
-  const startDow = (firstDay.getDay() + 6) % 7;
+  // getDay() → 0=Sun..6=Sat. Map to Mon-start weekday index, weekends become -1.
+  const toWeekdayIdx = (jsDow: number) => {
+    if (jsDow === 0 || jsDow === 6) return -1; // Sun/Sat skipped
+    return jsDow - 1; // Mon=0..Fri=4
+  };
+
+  const startIdx = toWeekdayIdx(firstDay.getDay());
   const daysInMonth = new Date(year, month + 1, 0).getDate();
 
   const cells: (number | null)[] = [];
-  // Leading empty cells
-  for (let i = 0; i < startDow; i++) cells.push(null);
-  // Day cells
-  for (let d = 1; d <= daysInMonth; d++) cells.push(d);
-  // Trailing empty cells to fill last row
-  while (cells.length % 7 !== 0) cells.push(null);
+  // Leading empty cells if month starts mid-week (Tue–Fri).
+  // If month starts on Sat/Sun, the first weekday cell is Mon, so no leading blanks.
+  if (startIdx > 0) {
+    for (let i = 0; i < startIdx; i++) cells.push(null);
+  }
+  for (let d = 1; d <= daysInMonth; d++) {
+    const dow = new Date(year, month, d).getDay();
+    if (dow === 0 || dow === 6) continue; // skip weekends
+    cells.push(d);
+  }
+  while (cells.length % 5 !== 0) cells.push(null);
   return cells;
 }
 
@@ -143,7 +153,7 @@ export function RCalendar({ data }: RCalendarProps) {
       </div>
 
       {/* Day-of-week headers */}
-      <div className="grid grid-cols-7 gap-0.5 mb-0.5 max-w-md mx-auto">
+      <div className="grid grid-cols-5 gap-0.5 mb-0.5 max-w-md mx-auto">
         {DAY_LABELS.map((d) => (
           <div key={d} className="text-center text-[9px] text-slate-600 font-medium">
             {d}
@@ -152,7 +162,7 @@ export function RCalendar({ data }: RCalendarProps) {
       </div>
 
       {/* Calendar grid */}
-      <div className="grid grid-cols-7 gap-0.5 max-w-md mx-auto">
+      <div className="grid grid-cols-5 gap-0.5 max-w-md mx-auto">
         {cells.map((day, i) => {
           if (day === null) {
             return <div key={`empty-${i}`} className="h-7" />;

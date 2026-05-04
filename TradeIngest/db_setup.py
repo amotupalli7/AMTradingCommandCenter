@@ -245,16 +245,22 @@ SCHEMA_DDL = [
     )
     """,
 
-    # daily_account: one row per trading day. account_value and goal_R are
-    # informational; per-trade $ Risk lives on trade_journal and is the
-    # source of truth for risk calcs (not always reconcilable with account_value).
+    # daily_account: per-day account_value + default dollar_risk. Carry-forward
+    # semantics: a trade on date D resolves $ Risk by using
+    # trade_journal.dollar_risk if set, else the most recent daily_account
+    # row with a non-null dollar_risk where date <= D.
     """
     CREATE TABLE IF NOT EXISTS daily_account (
         date          DATE PRIMARY KEY,
         account_value NUMERIC(14,2),
-        goal_R        NUMERIC(8,4)
+        dollar_risk   NUMERIC(12,4)
     )
     """,
+    # Bring an older daily_account into the new shape:
+    #   - drop goal_R (we don't track it anymore)
+    #   - add dollar_risk if it's not there yet
+    "ALTER TABLE daily_account DROP COLUMN IF EXISTS goal_R",
+    "ALTER TABLE daily_account ADD COLUMN IF NOT EXISTS dollar_risk NUMERIC(12,4)",
 
     # Helpful indexes for common queries
     "CREATE INDEX IF NOT EXISTS idx_raw_exec_date_symbol ON raw_executions(date, symbol)",
@@ -306,7 +312,6 @@ WITH per_trade AS (
         j.notes,
         j.mistake_notes,
         j.chart_url,
-        j.dollar_risk,
         j.x_failing_goal,
         j.x_non_playbook,
         j.x_selection,
@@ -318,21 +323,27 @@ WITH per_trade AS (
         j.win_override,
         COALESCE(j.win_override,
                  CASE WHEN t.net_pnl > 0 THEN 1 ELSE 0 END)        AS win,
-        d.account_value,
-        d.goal_R,
+        -- Effective account_value: carry-forward most recent on-or-before
+        -- daily_account row that has a non-null account_value.
+        d_av.account_value,
+        -- Effective dollar_risk: per-trade override on j.dollar_risk wins,
+        -- else carry-forward most recent on-or-before daily_account row
+        -- with a non-null dollar_risk.
+        COALESCE(j.dollar_risk, d_dr.dollar_risk)                    AS dollar_risk,
         -- ~Pos Size = entry_avg_price * max_position
         ROUND(t.entry_avg_price * t.max_position, 2)                AS pos_size,
         -- Risk % = $ Risk / account_value * 100
-        CASE WHEN d.account_value > 0 AND j.dollar_risk IS NOT NULL
-             THEN ROUND((j.dollar_risk / d.account_value) * 100, 4)
+        CASE WHEN d_av.account_value > 0
+              AND COALESCE(j.dollar_risk, d_dr.dollar_risk) IS NOT NULL
+             THEN ROUND((COALESCE(j.dollar_risk, d_dr.dollar_risk) / d_av.account_value) * 100, 4)
         END                                                          AS risk_pct,
         -- Acc % = net_pnl / account_value * 100
-        CASE WHEN d.account_value > 0
-             THEN ROUND((t.net_pnl / d.account_value) * 100, 4)
+        CASE WHEN d_av.account_value > 0
+             THEN ROUND((t.net_pnl / d_av.account_value) * 100, 4)
         END                                                          AS acc_pct,
-        -- R Net = net_pnl / dollar_risk
-        CASE WHEN j.dollar_risk > 0
-             THEN ROUND(t.net_pnl / j.dollar_risk, 4)
+        -- R Net = net_pnl / dollar_risk (using effective dollar_risk)
+        CASE WHEN COALESCE(j.dollar_risk, d_dr.dollar_risk) > 0
+             THEN ROUND(t.net_pnl / COALESCE(j.dollar_risk, d_dr.dollar_risk), 4)
         END                                                          AS r_net,
         -- X Score: weighted average. x_failing_goal acts as a gate - if set,
         -- score is 0. Otherwise: (total_weights - sum(flag*weight)) / total_weights.
@@ -352,7 +363,20 @@ WITH per_trade AS (
         END                                                          AS x_score
     FROM trades t
     LEFT JOIN trade_journal j ON j.legacy_trade_id = t.legacy_trade_id
-    LEFT JOIN daily_account d ON d.date            = t.date
+    LEFT JOIN LATERAL (
+        SELECT da.account_value
+        FROM daily_account da
+        WHERE da.date <= t.date AND da.account_value IS NOT NULL
+        ORDER BY da.date DESC
+        LIMIT 1
+    ) d_av ON true
+    LEFT JOIN LATERAL (
+        SELECT da.dollar_risk
+        FROM daily_account da
+        WHERE da.date <= t.date AND da.dollar_risk IS NOT NULL
+        ORDER BY da.date DESC
+        LIMIT 1
+    ) d_dr ON true
 )
 SELECT
     p.*,
@@ -371,6 +395,10 @@ def create_schema(cfg, target_db):
     )
     try:
         with conn, conn.cursor() as cur:
+            # Drop the view up front so column-altering DDL further down
+            # (e.g. removing daily_account.goal_R) isn't blocked by the
+            # view's dependency. The view is recreated by VIEW_DDL below.
+            cur.execute("DROP VIEW IF EXISTS v_trades_full")
             for ddl in SCHEMA_DDL:
                 cur.execute(ddl)
             # CREATE OR REPLACE VIEW can't reorder/rename columns. Drop first
