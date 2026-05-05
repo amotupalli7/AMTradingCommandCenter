@@ -10,7 +10,7 @@ import {
 import fs from "fs";
 import path from "path";
 
-function serveImage(imagePath: string) {
+function serveImage(imagePath: string, ifModSince?: string | null) {
   const ext = path.extname(imagePath).toLowerCase();
   const mimeTypes: Record<string, string> = {
     ".png": "image/png",
@@ -19,11 +19,25 @@ function serveImage(imagePath: string) {
     ".gif": "image/gif",
     ".webp": "image/webp",
   };
+  const stat = fs.statSync(imagePath);
+  const lastModified = new Date(Math.floor(stat.mtimeMs / 1000) * 1000).toUTCString();
+
+  if (ifModSince && ifModSince === lastModified) {
+    return new NextResponse(null, {
+      status: 304,
+      headers: {
+        "Cache-Control": "public, max-age=0, must-revalidate",
+        "Last-Modified": lastModified,
+      },
+    });
+  }
+
   const imageBuffer = fs.readFileSync(imagePath);
   return new NextResponse(imageBuffer, {
     headers: {
       "Content-Type": mimeTypes[ext] || "image/png",
-      "Cache-Control": "public, max-age=86400, immutable",
+      "Cache-Control": "public, max-age=0, must-revalidate",
+      "Last-Modified": lastModified,
       "Content-Length": String(imageBuffer.length),
     },
   });
@@ -81,7 +95,7 @@ export async function GET(
       }
     }
 
-    return serveImage(imagePath);
+    return serveImage(imagePath, _request.headers.get("if-modified-since"));
   } catch (err) {
     return NextResponse.json(
       { error: err instanceof Error ? err.message : "Failed to get image" },

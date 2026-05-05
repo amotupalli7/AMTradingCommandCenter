@@ -337,9 +337,12 @@ WITH per_trade AS (
               AND COALESCE(j.dollar_risk, d_dr.dollar_risk) IS NOT NULL
              THEN ROUND((COALESCE(j.dollar_risk, d_dr.dollar_risk) / d_av.account_value) * 100, 4)
         END                                                          AS risk_pct,
-        -- Acc % = net_pnl / account_value * 100
+        -- Acc % = approximate max position size (entry_avg_price * max_position)
+        -- as a fraction of account_value. We use max_position because it is the
+        -- largest share count the trade actually carried; entry_avg_price is a
+        -- close-enough stand-in for the average fill price during that peak.
         CASE WHEN d_av.account_value > 0
-             THEN ROUND((t.net_pnl / d_av.account_value) * 100, 4)
+             THEN ROUND(((t.entry_avg_price * t.max_position) / d_av.account_value) * 100, 4)
         END                                                          AS acc_pct,
         -- R Net = net_pnl / dollar_risk (using effective dollar_risk)
         CASE WHEN COALESCE(j.dollar_risk, d_dr.dollar_risk) > 0

@@ -401,14 +401,19 @@ def build_trade(symbol, trade_date, trade_index, trade_execs):
 # Fee allocation
 # ---------------------------------------------------------------------------
 
-def allocate_fees(trades, fee_rows, prior_fees_by_trade=None):
+def allocate_fees(trades, fee_rows, prior_fees_by_trade=None, broker="SPTD"):
     """
     Today's fees split across trades on the symbol in proportion to today's
     shares traded. Carry trades inherit the prior-day fee booking on top.
-    Commission = $0.0025 per share traded across all days.
+
+    Commission rate is per-broker:
+      SPTD: $0.0025/share (default)
+      CBRA: $0.00 — Cobra is currently free-commission for the first 100 days.
     """
     fee_by_symbol = {fr["symbol"]: fr for fr in fee_rows}
     prior_fees_by_trade = prior_fees_by_trade or {}
+
+    commission_per_share = 0.0 if broker == "CBRA" else 0.0025
 
     today_shares_by_symbol = {}
     for t in trades:
@@ -420,7 +425,7 @@ def allocate_fees(trades, fee_rows, prior_fees_by_trade=None):
         fees = fee_by_symbol.get(sym)
 
         all_shares = t["total_entry_shares"] + t["total_exit_shares"]
-        t["commission"] = round(all_shares * 0.0025, 6)
+        t["commission"] = round(all_shares * commission_per_share, 6)
 
         prior = prior_fees_by_trade.get(t.get("carry", {}).get("trade_id"), {})
         ecn   = prior.get("ecn_fees", 0.0)
@@ -741,7 +746,7 @@ def process_day(conn, date_prefix, force=False, broker=None):
                             "cat_fees": float(row[4] or 0),
                         }
 
-                allocate_fees(trades, fee_rows, prior_fees_by_trade=prior_fees_by_trade)
+                allocate_fees(trades, fee_rows, prior_fees_by_trade=prior_fees_by_trade, broker=broker)
 
                 execution_ids = insert_executions(cur, executions, broker=broker)
                 insert_fees(cur, fee_rows)
