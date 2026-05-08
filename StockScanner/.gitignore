@@ -1,3 +1,4 @@
 *.sql
 scanner_data.json
 *.log
+*.pyc

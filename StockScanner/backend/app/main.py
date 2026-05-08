@@ -8,8 +8,11 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from .config import settings
 from .db.session import connect
+from .enrichment import dt as dt_module
+from .enrichment import rename as rename_module
 from .market.live_hub import hub as live_trade_hub
 from .routes import candles as candles_routes
+from .routes import enrich as enrich_routes
 from .routes import scanner as scanner_routes
 from .scanner_bridge.watcher import ScannerHub, run_watcher
 
@@ -25,11 +28,15 @@ async def lifespan(app: FastAPI):
     # Live trade hub for chart panes (separate Polygon WS, per-ticker subs)
     live_trade_hub.start(asyncio.get_running_loop())
 
+    # Ticker-rename db (FMP) loaded once; lookups are then in-process dict access.
+    asyncio.create_task(rename_module.init())
+
     try:
         yield
     finally:
         # Stop live WS before scanner watcher so Polygon sees a clean disconnect.
         live_trade_hub.stop()
+        dt_module.shutdown()  # quit the persistent Chrome session if it spawned
         watcher_task.cancel()
         try:
             await watcher_task
@@ -51,6 +58,7 @@ app.include_router(scanner_routes.router)
 app.include_router(scanner_routes.ws_router)
 app.include_router(candles_routes.router)
 app.include_router(candles_routes.ws_router)
+app.include_router(enrich_routes.router)
 
 
 @app.get("/api/health")

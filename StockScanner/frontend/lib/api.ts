@@ -28,3 +28,56 @@ export type ScannerPanels = {
   runners: ScannerRow[];
   alerts: AlertRow[];
 };
+
+// ---------- Enrichment ----------
+
+export type FilingItem = {
+  file_number: string;
+  form: string;
+  company: string;
+  cik: string;
+  filing_date: string;
+  accession_number: string;
+  url: string;
+};
+
+export type FilingGroup = {
+  file_number: string;
+  most_recent: FilingItem;
+  older_filings: FilingItem[];
+};
+
+export type OwnershipFiling = FilingItem & {
+  owner: string;
+  position: string;
+};
+
+export type Rename = {
+  old_symbol: string;
+  date: string;
+  name: string;
+};
+
+export type EdgarPayload = {
+  ticker: string;
+  date: string;
+  previously: Rename | null;
+  filings: { groups: FilingGroup[]; error?: string };
+  ownership: { filings: OwnershipFiling[]; error?: string };
+};
+
+// DilutionTracker
+export type DTSection = {
+  type: "atm" | "shelf" | "warrant" | "conv_note" | "conv_pref" | "equity_line";
+  title: string;
+  fields: [string, string][];
+};
+
+export type DTPayload = {
+  sector_line: string;
+  mktcap_line: string;
+  description: string;
+  cash_position: string;
+  sections: DTSection[];
+  error?: string;
+};

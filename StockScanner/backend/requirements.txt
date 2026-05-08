@@ -8,3 +8,6 @@ pydantic-settings>=2.6
 websockets>=13
 watchfiles>=0.24
 massive
+selenium>=4.20
+webdriver-manager>=4.0
+edgartools>=5.0
