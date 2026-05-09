@@ -332,6 +332,136 @@ export async function updateTradeField(
 }
 
 // ---------------------------------------------------------------------------
+// Per-trade raw executions, with running position stats for the journal UI.
+// ---------------------------------------------------------------------------
+
+export interface TradeExecution {
+  id: number;
+  date: string;            // YYYY-MM-DD
+  time: string | null;     // HH:MM:SS or null (TOS rows have no time)
+  side: string;            // "B" | "S" | "SS"
+  price: number;
+  qty: number;
+  route: string;
+  // Running stats after this fill (chronological).
+  runningShares: number;   // signed: + long, - short
+  avgOpenPrice: number;    // weighted avg of open-side fills only
+  posValue: number;        // |runningShares| * avgOpenPrice
+  accPct: number | null;   // posValue / dollar_risk (R is 1% of account, so the
+                           // raw ratio already reads as a % of account)
+}
+
+interface RawExecutionRow {
+  // First underlying execution id in the (possibly merged) row — used as a
+  // stable React key. Merged rows lose the rest of the ids; that's fine.
+  id: number;
+  date: Date;
+  time: string | null;
+  side: string;
+  price: string;           // share-weighted avg across the merged group
+  qty: number;             // sum of qty across the merged group
+  route: string | null;    // arbitrary route from the group (informational)
+}
+
+export async function getTradeExecutions(
+  tradeId: number
+): Promise<TradeExecution[]> {
+  // Resolve dollar_risk from the same view that powers the trade card so the
+  // Acc % shown in the table lines up with the per-trade Acc % above it.
+  const trade = await query<{ direction: string; dollar_risk: string | null }>(
+    `SELECT direction, dollar_risk
+     FROM v_trades_full
+     WHERE legacy_trade_id = $1`,
+    [tradeId]
+  );
+  if (!trade[0]) return [];
+
+  const isShort = trade[0].direction === "Short";
+  const dollarRisk = trade[0].dollar_risk === null ? null : Number(trade[0].dollar_risk);
+
+  // Merge fills that share (date, time, side): brokers split a single
+  // intent across many partials at the same timestamp. We collapse them
+  // into one row with summed qty and a share-weighted avg price. NULL-time
+  // rows (TOS imports) skip merging via the COALESCE on id below.
+  const rows = await query<RawExecutionRow>(
+    `SELECT
+        MIN(re.id)                                   AS id,
+        re.date,
+        re.time,
+        re.side,
+        SUM(re.price * re.qty) / NULLIF(SUM(re.qty), 0) AS price,
+        SUM(re.qty)::int                             AS qty,
+        MIN(re.route)                                AS route
+     FROM raw_executions re
+     JOIN trade_executions te ON te.execution_id = re.id
+     JOIN trades t            ON t.id = te.trade_id
+     WHERE t.legacy_trade_id = $1
+     GROUP BY re.date, re.time, re.side,
+              CASE WHEN re.time IS NULL THEN re.id END
+     ORDER BY re.date, re.time NULLS LAST, MIN(re.id)`,
+    [tradeId]
+  );
+
+  // Walk fills, tracking signed running shares + weighted avg of opens only.
+  // For a short trade, an "open" is a sell-short (SS/S) and a "close" is a buy.
+  // For a long trade, an "open" is a buy and a "close" is a sell.
+  let runningShares = 0;        // signed
+  let openShares = 0;           // |running| during open accumulation
+  let openCostNumer = 0;        // sum(price * qty) over open-side fills
+
+  return rows.map((r) => {
+    const price = num(r.price);
+    const qty = r.qty;
+    const isOpenSide = isShort
+      ? r.side === "SS" || r.side === "S"
+      : r.side === "B";
+
+    if (isOpenSide) {
+      // Scale-in: extend the running weighted avg of opens.
+      openCostNumer += price * qty;
+      openShares += qty;
+      runningShares += isShort ? -qty : qty;
+    } else {
+      // Close-side: reduce position. Avg basis is preserved (FIFO/AVG-cost
+      // both leave the per-share avg unchanged for partial closes).
+      runningShares += isShort ? qty : -qty;
+      // If we flatten and re-open, reset basis once running returns to 0.
+      if (runningShares === 0) {
+        openShares = 0;
+        openCostNumer = 0;
+      } else {
+        // Trim openShares proportionally so a later scale-in re-weights cleanly.
+        const remainingAbs = Math.abs(runningShares);
+        if (openShares > remainingAbs) {
+          const scale = remainingAbs / openShares;
+          openCostNumer *= scale;
+          openShares = remainingAbs;
+        }
+      }
+    }
+
+    const avgOpenPrice = openShares > 0 ? openCostNumer / openShares : 0;
+    const posValue = Math.abs(runningShares) * avgOpenPrice;
+    const accPct =
+      dollarRisk && dollarRisk > 0 ? (posValue / dollarRisk) : null;
+
+    return {
+      id: r.id,
+      date: fmtDate(r.date),
+      time: r.time,
+      side: r.side,
+      price,
+      qty,
+      route: r.route ?? "",
+      runningShares,
+      avgOpenPrice: Number(avgOpenPrice.toFixed(4)),
+      posValue: Number(posValue.toFixed(2)),
+      accPct: accPct === null ? null : Number(accPct.toFixed(2)),
+    };
+  });
+}
+
+// ---------------------------------------------------------------------------
 // daily_account: per-trading-day account_value and goal_R
 // ---------------------------------------------------------------------------
 

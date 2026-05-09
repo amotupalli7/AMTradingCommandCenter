@@ -2,6 +2,9 @@
 
 import { Trade } from "@/lib/types";
 import { EditableField } from "./EditableField";
+import { TradeExecutionsTable } from "./TradeExecutionsTable";
+import { TradePnLChart } from "./TradePnLChart";
+import { useTradeExecutions } from "@/hooks/useTradeExecutions";
 import {
   SetupEditor,
   DollarRiskEditor,
@@ -38,6 +41,10 @@ export function TradeDetail({
   const [imageLoaded, setImageLoaded] = useState(false);
   const [imageError, setImageError] = useState(false);
   const [lightboxOpen, setLightboxOpen] = useState(false);
+
+  // Acc % shown on the card is the peak across all executions, computed
+  // off the same data the executions table renders. SWR de-dupes the fetch.
+  const { peakAccPct } = useTradeExecutions(trade["Trade ID"]);
 
   const imageSrc = chartUrl || `/api/trade/${trade["Trade ID"]}/image`;
 
@@ -161,8 +168,18 @@ export function TradeDetail({
           />
           <MetricCard
             label="Acc %"
-            value={`${trade["Acc %"].toFixed(1)}%`}
-            className={trade["Acc %"] >= 0 ? "text-emerald-400" : "text-red-400"}
+            value={peakAccPct === null || peakAccPct === undefined
+              ? "—"
+              : `${peakAccPct.toFixed(1)}%`}
+            className={
+              peakAccPct === null || peakAccPct === undefined
+                ? "text-slate-500"
+                : peakAccPct >= 100
+                  ? "text-red-400"
+                  : peakAccPct >= 50
+                    ? "text-yellow-400"
+                    : "text-emerald-400"
+            }
           />
         </div>
 
@@ -309,6 +326,15 @@ export function TradeDetail({
             onSaved={onSaved}
           />
         </div>
+
+        <div className="pt-4 border-t border-slate-800 space-y-2">
+          <h3 className="text-xs font-medium text-muted-foreground uppercase tracking-wider">
+            P&amp;L Trace
+          </h3>
+          <TradePnLChart tradeId={trade["Trade ID"]} />
+        </div>
+
+        <TradeExecutionsTable tradeId={trade["Trade ID"]} />
       </div>
     </div>
   );
