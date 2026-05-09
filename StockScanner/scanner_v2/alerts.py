@@ -67,28 +67,38 @@ def _send_embed(webhook_url: str, embed: dict, logger):
 
 
 def check_and_alert(state: ScannerState, config: Config):
-    """Called each scanner cycle. Sends Discord alerts for any newly qualifying tickers."""
-    if not _discord_enabled():
-        return
+    """Called each scanner cycle. Promotes newly qualifying tickers into the
+    `alerted_gappers` / `alerted_runners` sets (which gates HOD/backside detection
+    in ingest.py — `volume_minutes` only gets initialized for promoted tickers),
+    and optionally sends a Discord webhook on promotion.
+
+    The promotion tracking MUST run unconditionally — even with Discord disabled —
+    or HOD/backside alerts will never fire because no ticker ever gets promoted.
+    """
+    discord_on = _discord_enabled()
     with state.lock:
         # --- Pre-market gappers (first time is_gapper becomes True) ---
-        if config.gap_webhook:
-            for ticker, data in state.stock_data.items():
-                if ticker in state.alerted_gappers:
-                    continue
-                last = data.get("last_price") or 0
-                dollar_vol = data.get("total_volume", 0) * last
-                if (
-                    data.get("is_gapper")
-                    and data.get("gap_pct") is not None
-                    and dollar_vol >= 100_000
-                    and last >= 0.15
-                ):
-                    state.alerted_gappers.add(ticker)
-                    pm_high = data.get("premarket_high") or data["last_price"]
-                    prev = data["prev_close"]
-                    pm_gap = round((pm_high - prev) / prev * 100, 2)
-                    vol_m = data.get("total_volume", 0) / 1_000_000
+        for ticker, data in state.stock_data.items():
+            if ticker in state.alerted_gappers:
+                continue
+            last = data.get("last_price") or 0
+            dollar_vol = data.get("total_volume", 0) * last
+            if (
+                data.get("is_gapper")
+                and data.get("gap_pct") is not None
+                and dollar_vol >= 100_000
+                and last >= 0.15
+            ):
+                state.alerted_gappers.add(ticker)
+                pm_high = data.get("premarket_high") or data["last_price"]
+                prev = data["prev_close"]
+                pm_gap = round((pm_high - prev) / prev * 100, 2)
+                vol_m = data.get("total_volume", 0) / 1_000_000
+                state.logger.info(
+                    f"[Gapper] Ticker: {ticker} | PM Gap %: +{pm_gap:.2f}% | "
+                    f"PM High: ${pm_high:.2f} | Volume: {vol_m:.2f}M"
+                )
+                if discord_on and config.gap_webhook:
                     embed = {
                         "title": f"Gapper: {ticker} {pm_gap:.2f}%",
                         "color": 0x00FF99,
@@ -100,35 +110,32 @@ def check_and_alert(state: ScannerState, config: Config):
                         ],
                     }
                     _send_embed(config.gap_webhook, embed, state.logger)
-                    state.logger.info(
-                        f"[Gapper] Ticker: {ticker} | PM Gap %: +{pm_gap:.2f}% | "
-                        f"PM High: ${pm_high:.2f} | Volume: {vol_m:.2f}M"
-                    )
 
         # --- Intraday runners (not a gapper, moved 30%+ from open) ---
-        if config.runner_webhook:
-            for ticker, data in state.stock_data.items():
-                if ticker in state.alerted_runners:
-                    continue
-                if not data.get("is_gapper"):
-                    intraday = data.get("intraday_gap_pct")
-                    last = data.get("last_price") or 0
-                    dollar_vol = data.get("total_volume", 0) * last
-                    if intraday is not None and intraday >= 30 and dollar_vol >= 200_000 and last >= 0.15:
-                        state.alerted_runners.add(ticker)
-                        vol_m = data.get("total_volume", 0) / 1_000_000
-                        embed = {
-                            "title": f"Runner: {ticker} {intraday:.2f}%",
-                            "color": 0x3399FF,
-                            "fields": [
-                                {"name": "Type",    "value": "Intraday Runner",                       "inline": True},
-                                {"name": "Open %",  "value": f"+{intraday:.2f}%",          "inline": True},
-                                {"name": "Last",    "value": f"${data['last_price']:.2f}", "inline": True},
-                                {"name": "Volume",  "value": f"{vol_m:.2f}M",              "inline": True},
-                            ],
-                        }
-                        _send_embed(config.runner_webhook, embed, state.logger)
-                        state.logger.info(
-                            f"[Intraday Runner] Ticker: {ticker} | Open %: +{intraday:.2f}% | "
-                            f"Last: ${data['last_price']:.2f} | Volume: {vol_m:.2f}M"
-                        )
+        for ticker, data in state.stock_data.items():
+            if ticker in state.alerted_runners:
+                continue
+            if data.get("is_gapper"):
+                continue
+            intraday = data.get("intraday_gap_pct")
+            last = data.get("last_price") or 0
+            dollar_vol = data.get("total_volume", 0) * last
+            if intraday is not None and intraday >= 30 and dollar_vol >= 200_000 and last >= 0.15:
+                state.alerted_runners.add(ticker)
+                vol_m = data.get("total_volume", 0) / 1_000_000
+                state.logger.info(
+                    f"[Intraday Runner] Ticker: {ticker} | Open %: +{intraday:.2f}% | "
+                    f"Last: ${data['last_price']:.2f} | Volume: {vol_m:.2f}M"
+                )
+                if discord_on and config.runner_webhook:
+                    embed = {
+                        "title": f"Runner: {ticker} {intraday:.2f}%",
+                        "color": 0x3399FF,
+                        "fields": [
+                            {"name": "Type",    "value": "Intraday Runner",                       "inline": True},
+                            {"name": "Open %",  "value": f"+{intraday:.2f}%",          "inline": True},
+                            {"name": "Last",    "value": f"${data['last_price']:.2f}", "inline": True},
+                            {"name": "Volume",  "value": f"{vol_m:.2f}M",              "inline": True},
+                        ],
+                    }
+                    _send_embed(config.runner_webhook, embed, state.logger)

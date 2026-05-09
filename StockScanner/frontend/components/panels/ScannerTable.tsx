@@ -112,6 +112,13 @@ export function RunnerColumns(): Col[] {
   ];
 }
 
+const ALERT_BADGES: Record<string, { label: string; cls: string }> = {
+  new_gapper: { label: "GAP",  cls: "bg-accent/20 text-accent" },
+  new_runner: { label: "RUN",  cls: "bg-blue-500/20 text-blue-300" },
+  hod:        { label: "HOD",  cls: "bg-accent/20 text-accent" },
+  backside:   { label: "BS",   cls: "bg-warn/20 text-warn" },
+};
+
 export function AlertColumns(): Col[] {
   return [
     { key: "ticker", label: "Symbol", render: (r) => <span className="font-semibold">{r.ticker}</span> },
@@ -122,24 +129,24 @@ export function AlertColumns(): Col[] {
         const kinds = (r as AlertRow).kinds ?? [];
         return (
           <span className="flex gap-1">
-            {kinds.includes("hod") && (
-              <span className="px-1 rounded bg-accent/20 text-accent">HOD</span>
-            )}
-            {kinds.includes("backside") && (
-              <span className="px-1 rounded bg-warn/20 text-warn">BS</span>
-            )}
+            {kinds.map((k) => {
+              const b = ALERT_BADGES[k];
+              if (!b) return null;
+              return <span key={k} className={`px-1 rounded ${b.cls}`}>{b.label}</span>;
+            })}
           </span>
         );
       },
     },
     { key: "price", label: "Price", align: "right", render: (r) => fmtPrice(r.last_price) },
     {
-      key: "level",
-      label: "Lvl",
+      key: "pct",
+      label: "%",
       align: "right",
       render: (r) => {
-        const lvl = (r as AlertRow).backside_last_level ?? 0;
-        return lvl > 0 ? `${lvl}%` : "—";
+        const v = r.gap_pct ?? r.intraday_gap_pct;
+        if (v === null || v === undefined) return "—";
+        return <span className={v >= 0 ? "text-accent" : "text-danger"}>+{v.toFixed(1)}%</span>;
       },
     },
   ];

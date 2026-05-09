@@ -13,13 +13,16 @@ export type ScannerRow = {
   intraday_gap_pct: number | null;
 };
 
+export type AlertKind = "new_gapper" | "new_runner" | "hod" | "backside";
+
 export type AlertRow = ScannerRow & {
   hod_rvol: number | null;
   last_hod_alert_minute: number | null;
   backside_hod: number | null;
   backside_low: number | null;
   backside_last_level: number;
-  kinds: ("hod" | "backside")[];
+  first_seen_ms: number | null;
+  kinds: AlertKind[];
 };
 
 export type ScannerPanels = {
