@@ -58,7 +58,9 @@ export async function fetchMinuteAggs(
       ticker
     )}/range/1/minute/${fromMs}/${toMs}`
   );
-  url.searchParams.set("adjusted", "true");
+  // adjusted=false: return prices as printed at the time, not retroactively
+  // split-adjusted. We want the trade journal to match what the trader saw.
+  url.searchParams.set("adjusted", "false");
   url.searchParams.set("sort", "asc");
   url.searchParams.set("limit", "50000");
   url.searchParams.set("apiKey", apiKey);
