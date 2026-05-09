@@ -2,3 +2,4 @@
 scanner_data.json
 *.log
 *.pyc
+TickerEnrich/
