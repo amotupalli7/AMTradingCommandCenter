@@ -14,6 +14,7 @@ import { cn } from "@/lib/utils";
 import { isLongSide, tagColor, parseTags } from "@/lib/tradeUtils";
 import { useChartPreload } from "@/hooks/useChartPreload";
 import { useDatasets, Datasets } from "@/hooks/useDatasets";
+import { exportTradesWorkbook } from "@/lib/exportXlsx";
 
 // ─── Data filter types ──────────────────────────────────────────────────────
 // dataFilters maps dataset name → selected value ("" = all)
@@ -115,40 +116,6 @@ function applySorting(trades: Trade[], sortBy: SortKey, sortDir: SortDir): Trade
   });
 }
 
-// ─── CSV export ──────────────────────────────────────────────────────────────
-function escapeCsvField(value: string | number): string {
-  const str = String(value);
-  if (str.includes(",") || str.includes('"') || str.includes("\n")) {
-    return `"${str.replace(/"/g, '""')}"`;
-  }
-  return str;
-}
-
-function exportTradesToCsv(trades: Trade[]) {
-  const headers = [
-    "Date", "Enter Time", "Ticker", "Side", "Price",
-    "Net P&L", "Net R", "Win", "X Score",
-    "Setup", "Sub-Setup", "Tags",
-    "Entry Notes", "Exit Notes", "Notes", "Mistake Notes",
-  ];
-
-  const rows = trades.map((t) => [
-    t.Date, t["Enter Time"], t.Ticker, t.Side, t.Price,
-    t["Net P&L"], t["Net R"], t.Win, t["X Score"],
-    t.Setup, t["Sub-Setup"], t.Tags,
-    t["Entry Notes"], t["Exit Notes"], t.Notes, t["Mistake Notes"],
-  ].map(escapeCsvField).join(","));
-
-  const csv = [headers.join(","), ...rows].join("\n");
-  const blob = new Blob([csv], { type: "text/csv;charset=utf-8;" });
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement("a");
-  a.href = url;
-  a.download = `trades-export-${new Date().toISOString().slice(0, 10)}.csv`;
-  a.click();
-  URL.revokeObjectURL(url);
-}
-
 // ─── Main component ───────────────────────────────────────────────────────────
 export function TradeTable({ trades, onRefresh }: TradeTableProps) {
   const [selectedTradeId, setSelectedTradeId] = useState<number | null>(null);
@@ -160,6 +127,7 @@ export function TradeTable({ trades, onRefresh }: TradeTableProps) {
   const chartUrls = useChartPreload();
   const { datasets } = useDatasets();
   const [dataFilters, setDataFilters] = useState<DataFilters>({});
+  const [exportState, setExportState] = useState<"idle" | "working" | "error">("idle");
 
   // All unique tags across every trade (for autocomplete)
   const everyTag = useMemo(
@@ -443,14 +411,32 @@ export function TradeTable({ trades, onRefresh }: TradeTableProps) {
           {filteredTrades.length} / {trades.length} trade{trades.length !== 1 ? "s" : ""}
           &nbsp;&middot;&nbsp;Arrow keys to navigate
           <button
-            onClick={() => exportTradesToCsv(filteredTrades)}
-            className="ml-1 px-2.5 h-7 rounded-md border border-slate-700 text-slate-400 hover:text-white hover:border-slate-500 transition-colors flex items-center gap-1"
-            title="Export filtered trades to CSV"
+            onClick={async () => {
+              if (exportState === "working") return;
+              setExportState("working");
+              try {
+                await exportTradesWorkbook(filteredTrades);
+                setExportState("idle");
+              } catch (err) {
+                console.error("Export failed:", err);
+                setExportState("error");
+                setTimeout(() => setExportState("idle"), 4000);
+              }
+            }}
+            disabled={exportState === "working" || filteredTrades.length === 0}
+            className="ml-1 px-2.5 h-7 rounded-md border border-slate-700 text-slate-400 hover:text-white hover:border-slate-500 transition-colors flex items-center gap-1 disabled:opacity-50 disabled:cursor-not-allowed"
+            title={
+              exportState === "working"
+                ? "Fetching Polygon traces — may take a few seconds"
+                : exportState === "error"
+                  ? "Export failed — see console"
+                  : "Export filtered trades to XLSX (Trades / P&L Trace / Executions)"
+            }
           >
             <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
               <path strokeLinecap="round" strokeLinejoin="round" d="M4 16v2a2 2 0 002 2h12a2 2 0 002-2v-2M7 10l5 5m0 0l5-5m-5 5V3" />
             </svg>
-            Export
+            {exportState === "working" ? "Exporting…" : exportState === "error" ? "Export failed" : "Export"}
           </button>
         </div>
       </div>
