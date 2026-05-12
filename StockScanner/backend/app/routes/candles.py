@@ -20,6 +20,7 @@ async def get_candles(
     from_ms: int | None = Query(None),
     to_ms: int | None = Query(None),
     days: int = Query(1, ge=1, le=3650, description="convenience: last N calendar days"),
+    refresh: bool = Query(False, description="if true, re-fetch the entire window from Polygon and overwrite the DB cache (use to recover from gaps the normal hole-fill missed)"),
 ):
     ticker = ticker.upper()
     if tf in candles_store.INTRADAY_TF_SECONDS:
@@ -28,7 +29,7 @@ async def get_candles(
         if from_ms is None:
             from_ms = to_ms - days * 86_400_000
         try:
-            rows = await candles_store.get_intraday(ticker, from_ms, to_ms, tf)
+            rows = await candles_store.get_intraday(ticker, from_ms, to_ms, tf, force_refresh=refresh)
         except RuntimeError as e:
             raise HTTPException(status_code=503, detail=str(e))
         return {"ticker": ticker, "tf": tf, "from_ms": from_ms, "to_ms": to_ms, "bars": rows}

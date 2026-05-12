@@ -19,11 +19,19 @@ from __future__ import annotations
 
 import asyncio
 from datetime import date, datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 
 import psycopg
 
 from ..db.session import connect
 from . import polygon
+
+_ET = ZoneInfo("America/New_York")
+# Max number of internal holes we'll try to backfill per get_intraday call.
+# Bounds Polygon REST cost on cold reads of long-windowed, gappy tickers.
+_MAX_INTERNAL_HOLE_BACKFILLS = 5
+# Don't bother backfilling holes shorter than this (most are real quiet minutes).
+_MIN_HOLE_MINUTES = 2
 
 # Allowed intraday timeframes and their bucket size in seconds.
 INTRADAY_TF_SECONDS: dict[str, int] = {
@@ -56,6 +64,77 @@ def _ts_range_in_window(ticker: str, from_ms: int, to_ms: int) -> tuple[int | No
         if row is None:
             return (None, None)
         return (row.get("min_ms"), row.get("max_ms"))
+
+
+def _list_minutes_in_window(ticker: str, from_ms: int, to_ms: int) -> set[int]:
+    """Return the set of minute-bucket ints (epoch_ms // 60000) we have in DB."""
+    with connect() as conn, conn.cursor() as cur:
+        cur.execute(
+            "SELECT (EXTRACT(EPOCH FROM ts)::bigint / 60) AS m "
+            "FROM candles_1m WHERE ticker = %s AND ts >= to_timestamp(%s/1000.0) "
+            "AND ts < to_timestamp(%s/1000.0)",
+            (ticker, from_ms, to_ms),
+        )
+        return {int(r["m"]) for r in cur.fetchall()}
+
+
+def _internal_rth_holes(have_minutes: set[int], from_ms: int, to_ms: int) -> list[tuple[int, int]]:
+    """Find contiguous missing-minute ranges (as [from_ms, to_ms)) inside regular
+    trading hours that are large enough to be worth a Polygon REST backfill.
+
+    Only RTH (9:30-16:00 ET, Mon-Fri) is considered — quiet pre/after-market minutes
+    are common and not worth REST cost. Skip holes < _MIN_HOLE_MINUTES.
+    Coalesce adjacent missing minutes into a single range. Cap to
+    _MAX_INTERNAL_HOLE_BACKFILLS, prioritizing the widest holes.
+    """
+    if not have_minutes:
+        return []
+    earliest = min(have_minutes)
+    latest = max(have_minutes)
+    # Internal-hole scan is bounded by what we already have, not the full window —
+    # head/tail gaps are handled separately by get_intraday's existing logic.
+    scan_lo = max(earliest, from_ms // 60_000)
+    scan_hi = min(latest, (to_ms - 1) // 60_000)
+
+    runs: list[tuple[int, int]] = []  # (start_minute, end_minute_inclusive)
+    run_start: int | None = None
+    for m in range(scan_lo, scan_hi + 1):
+        if m in have_minutes:
+            if run_start is not None:
+                runs.append((run_start, m - 1))
+                run_start = None
+        else:
+            if not _is_rth_minute(m):
+                # Break any in-progress run at RTH boundaries so a contiguous
+                # pre-market hole + RTH hole isn't merged across the gap.
+                if run_start is not None:
+                    runs.append((run_start, m - 1))
+                    run_start = None
+                continue
+            if run_start is None:
+                run_start = m
+    if run_start is not None:
+        runs.append((run_start, scan_hi))
+
+    # Filter to RTH-only runs of meaningful width.
+    holes: list[tuple[int, int]] = []
+    for lo, hi in runs:
+        if hi - lo + 1 < _MIN_HOLE_MINUTES:
+            continue
+        # Both endpoints already RTH by construction; widen to (lo, hi+1) for [from_ms, to_ms).
+        holes.append((lo * 60_000, (hi + 1) * 60_000))
+    # Widest first.
+    holes.sort(key=lambda r: r[0] - r[1])
+    return holes[:_MAX_INTERNAL_HOLE_BACKFILLS]
+
+
+def _is_rth_minute(minute_bucket: int) -> bool:
+    """True if epoch-minute falls inside 9:30-16:00 ET on a weekday."""
+    dt = datetime.fromtimestamp(minute_bucket * 60, tz=timezone.utc).astimezone(_ET)
+    if dt.weekday() >= 5:  # Sat/Sun
+        return False
+    hm = dt.hour * 60 + dt.minute
+    return 9 * 60 + 30 <= hm < 16 * 60
 
 
 def _insert_minute_bars(ticker: str, bars: list[dict]) -> int:
@@ -167,19 +246,38 @@ def _query_daily(ticker: str, from_date: date, to_date: date) -> list[dict]:
         return [dict(r) for r in cur.fetchall()]
 
 
-async def get_intraday(ticker: str, from_ms: int, to_ms: int, tf: str) -> list[dict]:
+async def get_intraday(
+    ticker: str,
+    from_ms: int,
+    to_ms: int,
+    tf: str,
+    force_refresh: bool = False,
+) -> list[dict]:
     """Return aggregated bars for [from_ms, to_ms).
 
-    Backfills any minutes that aren't in the DB. We check three regions:
+    Backfills any minutes that aren't in the DB. We check four regions:
       - "head gap":  [from_ms, earliest_bar)  — cached window is shorter than what
                                                 you're asking for now (e.g. user
                                                 widened the lookback).
       - "tail gap":  [latest_bar+60s, to_ms)  — bars have closed since we cached.
+      - "internal":  RTH holes inside [earliest, latest] — when the scanner was
+                                                promoted late, or live_hub
+                                                disconnected during the day.
       - "cold":      everything                — first time we've seen this ticker.
 
-    We don't fill internal holes (gaps within [earliest, latest]); a missing minute
-    in the middle of a known range is just a quiet minute, not a cache miss.
+    force_refresh: re-fetch the most recent day's worth from Polygon and let the
+    upsert overwrite the cached row, even when DB coverage looks complete. Use
+    when a user notices visible gaps the normal hole detector missed. Bounded to
+    24h so this can't be used to hammer Polygon for huge windows.
     """
+    if force_refresh:
+        # Refetch the tail (up to 24h) authoritatively. Anything older than 24h
+        # is left as-is; long lookbacks are stable and rarely the cause of gaps.
+        refresh_from = max(from_ms, to_ms - 86_400_000)
+        bars = await polygon.fetch_minute_aggs(ticker, refresh_from, to_ms)
+        if bars:
+            await asyncio.to_thread(_insert_minute_bars, ticker, bars)
+
     min_ms, max_ms = await asyncio.to_thread(_ts_range_in_window, ticker, from_ms, to_ms)
 
     if min_ms is None:
@@ -193,6 +291,13 @@ async def get_intraday(ticker: str, from_ms: int, to_ms: int, tf: str) -> list[d
             tasks.append(polygon.fetch_minute_aggs(ticker, tail_from, to_ms))
         if from_ms < min_ms:
             tasks.append(polygon.fetch_minute_aggs(ticker, from_ms, min_ms))
+        # Internal RTH holes — scanner_v2's emitter only writes promoted tickers,
+        # so pre-promotion RTH minutes never land in the DB even if Polygon saw
+        # trades. Fill them here so the chart isn't visibly gappy.
+        have = await asyncio.to_thread(_list_minutes_in_window, ticker, from_ms, to_ms)
+        holes = _internal_rth_holes(have, from_ms, to_ms)
+        for h_from, h_to in holes:
+            tasks.append(polygon.fetch_minute_aggs(ticker, h_from, h_to))
         if tasks:
             for bars in await asyncio.gather(*tasks):
                 await asyncio.to_thread(_insert_minute_bars, ticker, bars)

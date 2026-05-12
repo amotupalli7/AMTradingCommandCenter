@@ -18,6 +18,17 @@ class Settings(BaseSettings):
 
     FRONTEND_ORIGIN: str = "http://localhost:3000"
 
+    # Local TCP trade gateway hosted by scanner_v2 — backend connects to it
+    # rather than opening its own Polygon WS (Polygon allows 1 concurrent
+    # connection per API key).
+    TRADE_GATEWAY_HOST: str = "127.0.0.1"
+    TRADE_GATEWAY_PORT: int = 8765
+    # Seconds to wait before live_hub's first gateway connection attempt.
+    # scanner_v2 takes ~15-30s to boot (snapshot fetch + premarket bootstrap)
+    # before it opens the gateway. Without this delay the backend's first
+    # connect attempts fail and spam warnings until scanner_v2 catches up.
+    LIVE_HUB_STARTUP_DELAY: float = 15.0
+
     model_config = SettingsConfigDict(
         env_file=BACKEND_DIR / ".env",
         env_file_encoding="utf-8",

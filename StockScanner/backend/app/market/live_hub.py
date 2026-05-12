@@ -1,8 +1,13 @@
 """Live trade fanout for chart panes.
 
-Owns a *second* Polygon websocket connection (separate from scanner_v2's full T.* firehose).
-Subscribes per-ticker `T.AAPL` style, dynamically adding/removing subscriptions as chart
-panes connect and disconnect.
+Consumes scanner_v2's local TCP trade gateway (127.0.0.1:8765) instead of opening
+its own Polygon WebSocket. Polygon allows only one concurrent WS per API key, and
+scanner_v2 already holds it open for the T.* firehose, so opening a second from
+the backend trips a 1008 policy-violation reject.
+
+The gateway streams *all* trades scanner_v2 sees. We only build in-progress bars
+and fan out events for tickers a chart pane has subscribed to — the firehose
+contains thousands of tickers and we'd OOM otherwise.
 
 Per trade we push two kinds of events to subscribers:
   - tick:  {kind: "tick", ticker, ts_ms, price, size}        (every trade)
@@ -19,14 +24,13 @@ candles.py handles cold reads. Doing it in two places would race.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
+import socket
 import threading
 import time
 from collections import defaultdict
 from typing import Iterable
-
-from massive import WebSocketClient
-from massive.websocket.models import Feed, Market
 
 from ..config import settings
 from . import polygon as polygon_rest
@@ -35,10 +39,25 @@ from . import candles as candles_store
 logger = logging.getLogger(__name__)
 
 # Trade conditions to filter out (late prints, off-exchange, corrections, etc).
-# Kept in sync with scanner_v2/ingest.py BAD_CONDITIONS — both processes consume
-# the same Polygon T.* feed and need identical filtering, but the two run as
-# separate processes so we can't import across the boundary.
+# scanner_v2's gateway already filters these — kept here defensively in case the
+# gateway is bypassed (tests, debugging) or runs an older filter set.
 BAD_CONDITIONS = frozenset({2, 7, 13, 15, 16, 20, 21, 37, 52, 53})
+
+
+class _GatewayTrade:
+    """Duck-typed Polygon trade message. The gateway sends compact JSON with
+    short field names; this object presents the same attribute surface as the
+    `massive` library's trade message (.symbol/.price/.size/.timestamp/.conditions)
+    so _on_msgs doesn't care about the transport.
+    """
+    __slots__ = ("symbol", "price", "size", "timestamp", "conditions")
+
+    def __init__(self, d: dict) -> None:
+        self.symbol = d.get("s")
+        self.price = d.get("p")
+        self.size = d.get("z") or 0
+        self.timestamp = d.get("t")
+        self.conditions = d.get("c")
 
 
 class _Bar:
@@ -75,18 +94,16 @@ class LiveTradeHub:
         self._subs: dict[str, set[asyncio.Queue]] = defaultdict(set)
         self._lock = asyncio.Lock()
 
-        # In-progress bar per ticker (computed in the WS callback thread)
+        # In-progress bar per ticker (computed in the gateway-client thread)
         self._bars: dict[str, _Bar] = {}
         self._bars_lock = threading.Lock()
 
-        self._client: WebSocketClient | None = None
         self._client_thread: threading.Thread | None = None
         self._loop: asyncio.AbstractEventLoop | None = None  # main asyncio loop
-        # Set on shutdown so the reconnect loop exits cleanly. Without this, a
-        # uvicorn --reload restart can leave the old daemon thread retrying against
-        # Polygon while the new process opens its own WS, tripping the 1-connection
-        # limit and getting 1008 policy-violation rejects on both.
+        # Set on shutdown so the reconnect loop exits cleanly.
         self._stop = threading.Event()
+        self._gateway_host = settings.TRADE_GATEWAY_HOST
+        self._gateway_port = settings.TRADE_GATEWAY_PORT
 
     # ---------- subscription management ----------
 
@@ -130,13 +147,19 @@ class LiveTradeHub:
             minute_start_ms = (now_ms // 60_000) * 60_000
             current_minute = minute_start_ms // 60_000
 
+            # Polygon's REST aggregate for the current minute can lag the live trade
+            # stream by 1-2s right after a minute rollover. Retry once after a short
+            # sleep so the open seed actually reflects this minute's first prints.
             bars = await polygon_rest.fetch_minute_aggs(ticker, minute_start_ms, now_ms + 1)
-            if not bars:
-                return
-            b = bars[-1]
+            b = bars[-1] if bars else None
+            if b is None or int(b["ts_ms"]) // 60_000 != current_minute:
+                await asyncio.sleep(1.0)
+                retry_now_ms = int(time.time() * 1000)
+                bars = await polygon_rest.fetch_minute_aggs(ticker, minute_start_ms, retry_now_ms + 1)
+                b = bars[-1] if bars else None
+                if b is None or int(b["ts_ms"]) // 60_000 != current_minute:
+                    return
             ts_ms = int(b["ts_ms"])
-            if ts_ms // 60_000 != current_minute:
-                return  # REST returned the previous minute, not the current one
 
             with self._bars_lock:
                 bar = self._bars.get(ticker)
@@ -178,92 +201,141 @@ class LiveTradeHub:
                     with self._bars_lock:
                         self._bars.pop(ticker, None)
 
-    # ---------- polygon websocket lifecycle ----------
+    # ---------- gateway client lifecycle ----------
 
     def start(self, loop: asyncio.AbstractEventLoop) -> None:
-        """Spin up the Polygon WS in a background thread. Idempotent."""
+        """Spin up the gateway-client reader thread. Idempotent."""
         if self._client_thread is not None:
-            return
-        if not settings.POLYGON_API_KEY:
-            logger.warning("LiveTradeHub.start: POLYGON_API_KEY missing; live charts disabled")
             return
         self._loop = loop
         self._stop.clear()
-        # max_reconnects=5 (library default) is OK; what matters is that the
-        # `massive` library's internal reconnect loop is the *only* one — our
-        # outer loop used to race it and double-count concurrent connections.
-        self._client = WebSocketClient(
-            api_key=settings.POLYGON_API_KEY, feed=Feed.RealTime, market=Market.Stocks,
-            max_reconnects=5,
-        )
         self._client_thread = threading.Thread(
-            target=self._run_client, name="live-trade-ws", daemon=True
+            target=self._run_client, name="live-trade-gateway", daemon=True
         )
         self._client_thread.start()
-        logger.info("LiveTradeHub started")
+        logger.info("LiveTradeHub started (gateway %s:%d)", self._gateway_host, self._gateway_port)
 
     def stop(self) -> None:
-        """Signal the WS loop to exit and explicitly send a close frame to Polygon.
-
-        Without the close frame Polygon's gateway can hold the slot open until its
-        idle timeout (~60-120s); ghost sessions then accumulate across restarts
-        and trip the per-key concurrent-connection limit. WebSocketClient.close()
-        is async so we drive it on a fresh event loop here.
-        """
+        """Signal the reader to exit. Socket close happens in _run_client."""
         self._stop.set()
-        client = self._client
-        if client is None:
-            return
-        try:
-            asyncio.run(client.close())
-        except Exception:
-            logger.debug("WS close errored", exc_info=True)
 
     def _run_client(self) -> None:
-        # Single, simple loop. The `massive` library's `connect()` already does
-        # its own reconnect-with-backoff inside `client.run()` (max_reconnects=5).
-        # We only re-enter `run()` if it gave up entirely — and we wait long enough
-        # that any half-open Polygon session has timed out before reconnecting.
-        # Previously we had nested reconnect loops (this one + the library's),
-        # which during transient errors caused two concurrent socket attempts and
-        # tripped Polygon's 1-connection-per-key limit.
-        while not self._stop.is_set():
-            # Re-arm any tickers chart panes are watching — after max_reconnects
-            # the library clears its sub set, so without this the next run()
-            # would connect with no subscriptions.
-            for ticker in list(self._subs.keys()):
-                self._client.subscribe(f"T.{ticker}")
-            try:
-                self._client.run(self._on_msgs)
-            except Exception as e:
-                if "1008" in str(e) or "policy violation" in str(e).lower():
-                    logger.warning("live-trade-ws rejected by Polygon (already-connected). "
-                                   "Waiting 30s for old session to drain.")
-                else:
-                    logger.exception("live-trade-ws errored")
-            if self._stop.wait(30):
-                break
+        """Connect to scanner_v2's trade gateway, parse JSON-line trades, and
+        feed batches into _on_msgs. Reconnects forever with backoff — the
+        gateway may not be up yet on first backend boot, and scanner_v2
+        restarts shouldn't kill chart streaming.
 
+        Batching: gateway writes are TCP-coalesced (TCP_NODELAY on the server
+        side means small writes ship promptly, but the kernel still groups them).
+        We read up to ~64KB, split on newlines, hand the resulting list to
+        _on_msgs — preserves the original "batch per WS message" hot-path shape.
+        """
+        # Initial startup pause. scanner_v2 takes ~15-30s to bootstrap (full
+        # market snapshot + premarket high backfill) before it starts the
+        # gateway server. Connecting any sooner just fails and spams warnings.
+        startup_delay = settings.LIVE_HUB_STARTUP_DELAY
+        if startup_delay > 0:
+            logger.info("live-trade-gateway: waiting %.1fs for scanner_v2 to start", startup_delay)
+            if self._stop.wait(startup_delay):
+                return
+        backoff = 1.0
+        while not self._stop.is_set():
+            sock: socket.socket | None = None
+            try:
+                sock = socket.create_connection(
+                    (self._gateway_host, self._gateway_port), timeout=5.0
+                )
+                sock.settimeout(None)
+            except OSError as e:
+                logger.warning(
+                    "live-trade-gateway: cannot connect to %s:%d (%s); "
+                    "retrying in %.1fs. Is scanner_v2 running?",
+                    self._gateway_host, self._gateway_port, e, backoff,
+                )
+                if self._stop.wait(backoff):
+                    return
+                backoff = min(backoff * 2, 30.0)
+                continue
+
+            # Connected. Clear any stale in-progress bars from the prior session
+            # so the first tick re-primes from REST rather than rolling over a
+            # bar from before the gateway dropped. Re-prime each ticker the chart
+            # panes are watching.
+            with self._bars_lock:
+                self._bars.clear()
+            if self._loop is not None:
+                for ticker in list(self._subs.keys()):
+                    asyncio.run_coroutine_threadsafe(
+                        self._prime_in_progress(ticker), self._loop
+                    )
+            backoff = 1.0
+            logger.info("live-trade-gateway connected")
+
+            try:
+                self._read_loop(sock)
+            except Exception:
+                logger.exception("live-trade-gateway read errored")
+            finally:
+                try: sock.close()
+                except OSError: pass
+                logger.warning("live-trade-gateway disconnected; will reconnect")
+                if self._stop.wait(backoff):
+                    return
+
+    def _read_loop(self, sock: socket.socket) -> None:
+        """Read newline-delimited JSON trades, batch by recv chunk, decode into
+        _GatewayTrade objects, hand to _on_msgs as a list."""
+        buf = bytearray()
+        while not self._stop.is_set():
+            chunk = sock.recv(65536)
+            if not chunk:
+                return  # gateway closed
+            buf.extend(chunk)
+            # Split out complete lines; keep any partial trailing line in buf.
+            *lines, rest = buf.split(b"\n")
+            buf = bytearray(rest)
+            if not lines:
+                continue
+            trades: list[_GatewayTrade] = []
+            for raw in lines:
+                if not raw:
+                    continue
+                try:
+                    d = json.loads(raw)
+                except ValueError:
+                    continue
+                trades.append(_GatewayTrade(d))
+            if trades:
+                self._on_msgs(trades)
+
+    # Legacy helpers — kept as no-ops so call sites in subscribe/unsubscribe
+    # don't need to branch. The gateway sends the firehose; per-ticker
+    # subscribe/unsubscribe to Polygon is no longer our concern.
     def _add_polygon_sub(self, ticker: str) -> None:
-        if self._client is not None:
-            self._client.subscribe(f"T.{ticker}")
+        pass
 
     def _remove_polygon_sub(self, ticker: str) -> None:
-        if self._client is not None and hasattr(self._client, "unsubscribe"):
-            try:
-                self._client.unsubscribe(f"T.{ticker}")  # type: ignore[attr-defined]
-            except Exception:
-                pass
+        pass
 
     # ---------- trade fanout ----------
 
     def _on_msgs(self, msgs: Iterable) -> None:
-        # Runs in the websocket thread, NOT the asyncio loop. Hot path: every
-        # incoming Polygon trade comes through here. Keep the per-message work
-        # minimal and avoid redundant attribute lookups.
+        # Runs in the gateway-client thread, NOT the asyncio loop. Hot path:
+        # every trade scanner_v2 sees flows through here. Keep work minimal.
         per_ticker: dict[str, list[dict]] = {}
         rollovers: set[str] = set()
-        rollovers_finalized: dict[str, int] = {}
+        # (ticker, minute) — set rather than dict so a batch that crosses two
+        # minute boundaries for the same ticker (rare but possible at high latency)
+        # corrects both finalized rows, not just the last.
+        rollovers_finalized: set[tuple[str, int]] = set()
+
+        # Snapshot subscribed tickers once per batch. The firehose contains
+        # thousands of tickers and we'd OOM building _bars for all of them;
+        # only chart-pane subscribers matter here. _subs is mutated on the
+        # asyncio loop; this dict read is safe (atomic in CPython).
+        subscribed = set(self._subs.keys())
+        if not subscribed:
+            return
 
         with self._bars_lock:
             for msg in msgs:
@@ -271,9 +343,11 @@ class LiveTradeHub:
                 if conds and not BAD_CONDITIONS.isdisjoint(conds):
                     continue
                 ticker = getattr(msg, "symbol", None)
+                if ticker not in subscribed:
+                    continue
                 price = getattr(msg, "price", None)
                 ts = getattr(msg, "timestamp", None)
-                if ticker is None or price is None or ts is None:
+                if price is None or ts is None:
                     continue
                 size = int(getattr(msg, "size", None) or 0)
                 ts = int(ts)
@@ -293,7 +367,7 @@ class LiveTradeHub:
                 if bar is None or bar.minute != minute:
                     if bar is not None and bar.minute < minute:
                         events_for_ticker.append(bar.to_event(ticker))
-                        rollovers_finalized[ticker] = bar.minute
+                        rollovers_finalized.add((ticker, bar.minute))
                     self._bars[ticker] = _Bar(minute, price_f, size)
                     rollovers.add(ticker)
                 else:
@@ -312,7 +386,7 @@ class LiveTradeHub:
         # Also correct the *just-finalized* (previous) minute's row in the DB. Polygon
         # REST has every print for that minute now, so this overwrites whatever wrong
         # bar may have been built from sparse WS ticks during the prior minute.
-        for ticker, prev_minute in rollovers_finalized.items():
+        for ticker, prev_minute in rollovers_finalized:
             asyncio.run_coroutine_threadsafe(
                 candles_store.correct_finalized_minute(ticker, prev_minute * 60_000),
                 self._loop,

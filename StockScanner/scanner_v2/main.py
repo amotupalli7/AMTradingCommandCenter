@@ -9,6 +9,7 @@ from scanner_v2.ingest import fetch_snapshot, bootstrap_premarket_highs, classif
 from scanner_v2.scanner import run_gap_scanner
 from scanner_v2.persistence import load_data, save_data, run_save_loop
 from scanner_v2.candle_emitter import CandleEmitter
+from scanner_v2.trade_gateway import TradeGateway
 
 
 def setup_logger(config: Config) -> logging.Logger:
@@ -48,11 +49,20 @@ def main():
     # Live 1m candle emitter — writes promoted-ticker bars to scanner_db.candles_1m
     candle_emitter = CandleEmitter(state, logger)
 
+    # Local TCP fanout for live trades. The backend's live_hub connects here
+    # rather than opening its own Polygon WS (Polygon allows only 1 concurrent
+    # connection per API key).
+    import os
+    gateway_host = os.getenv("TRADE_GATEWAY_HOST", "127.0.0.1")
+    gateway_port = int(os.getenv("TRADE_GATEWAY_PORT", "8765"))
+    trade_gateway = TradeGateway(host=gateway_host, port=gateway_port)
+    trade_gateway.start()
+
     # 3. Start all worker threads (all daemon so they die if main exits)
     threading.Thread(
         target=run_websocket,
         args=(state, config),
-        kwargs={"extra_handlers": [candle_emitter.handle_trades]},
+        kwargs={"extra_handlers": [candle_emitter.handle_trades, trade_gateway.handle_trades]},
         daemon=True,
         name="websocket",
     ).start()
@@ -72,6 +82,7 @@ def main():
         state.shutdown_flag.set()
         save_data(state, config)
         candle_emitter.flush_all()
+        trade_gateway.stop()
         # Send a proper Polygon close frame so the gateway frees our session
         # slot immediately. Without this, the slot lingers until Polygon's idle
         # timeout (~60-120s) and ghost sessions accumulate across restarts.

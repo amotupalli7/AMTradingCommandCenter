@@ -74,6 +74,12 @@ class CandleEmitter:
         self._poly_client = None  # lazy
         threading.Thread(target=self._correct_worker, name="candle-correct",
                          daemon=True).start()
+        # Stale-bar flush: an in-memory bar only flushes on minute rollover, so a
+        # ticker that trades in minute N then goes silent never persists. If
+        # scanner_v2 restarts during the quiet window, that bar is lost. Periodic
+        # flush every ~5s catches these once minute_bucket is more than a minute old.
+        threading.Thread(target=self._stale_flush_worker, name="candle-stale-flush",
+                         daemon=True).start()
 
     def _conn_ok(self) -> psycopg.Connection:
         if self._conn is None or self._conn.closed:
@@ -149,6 +155,31 @@ class CandleEmitter:
         for ticker, bar in snapshot:
             self._flush(ticker, bar)
         self._correct_stop.set()
+
+    # ---------- stale-bar flush ----------
+
+    def _stale_flush_worker(self) -> None:
+        """Drain in-memory bars whose minute has fully closed but no new trade
+        has rolled them over. Run every ~5s; only flush bars whose minute is
+        more than one minute old to give a grace window for late prints and
+        avoid racing live handle_trades on the current/just-closed minute."""
+        while not self._correct_stop.is_set():
+            if self._correct_stop.wait(5.0):
+                break
+            now_minute = int(time.time() // 60)
+            cutoff = now_minute - 1  # only flush bars older than this
+            stale: list[tuple[str, list]] = []
+            with self._lock:
+                for ticker, bar in list(self._bars.items()):
+                    if bar[0] < cutoff:
+                        stale.append((ticker, bar))
+                        del self._bars[ticker]
+            for ticker, bar in stale:
+                try:
+                    self._flush(ticker, bar)
+                    self._correct_q.put((ticker, bar[0]))
+                except Exception as e:
+                    self.logger.debug(f"stale flush failed for {ticker}: {e}")
 
     # ---------- REST correction ----------
 

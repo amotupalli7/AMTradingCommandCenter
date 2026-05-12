@@ -44,7 +44,7 @@ export function ChartGrid({
     });
   }, [selectedTicker]); // eslint-disable-line react-hooks/exhaustive-deps
 
-  function setPaneTicker(i: number, ticker: string) {
+  function setPaneTicker(i: number, ticker: string | null) {
     setPanes((cur) => {
       const next = [...cur];
       next[i] = { ...next[i], ticker };

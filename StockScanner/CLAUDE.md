@@ -65,6 +65,15 @@ frontend/            # Next.js (React), Tailwind
 - DT scrape uses persistent headless Chrome session (same pattern as TickerEnrich).
 - Deployment: local Windows for now; mobile access via local IP / Tailscale.
 
+### Trade gateway (2026-05-11)
+
+Polygon enforces 1 concurrent WebSocket per API key. scanner_v2 already holds the `T.*` firehose, so the backend cannot open its own per-ticker WS — it gets 1008 policy-violation rejects.
+
+- `scanner_v2/trade_gateway.py` runs a small TCP server on `127.0.0.1:8765` that streams every (filtered) trade as newline-delimited JSON: `{"s","p","z","t","c"}`.
+- `backend/app/market/live_hub.py` connects as a TCP client (no Polygon WS), reads the firehose, filters by chart subscribers, and fans events out to chart panes exactly as before.
+- Start order: **scanner_v2 must be running before backend** for live charts to work. live_hub will reconnect with backoff until the gateway comes up.
+- Configure via `TRADE_GATEWAY_HOST` / `TRADE_GATEWAY_PORT` env vars (both sides).
+
 ## Reused code from TickerEnrich
 
 - `TickerEnrich/dt_scraper.py`, `edgar_fetcher.py`, `ticker_data.py` — ported as FastAPI routes
